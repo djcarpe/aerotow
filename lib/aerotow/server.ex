@@ -10,16 +10,23 @@ defmodule Aerotow.Server do
     1. reads the instance's id from `<dir>/instance.json`, or makes one (32
        hex digits) and writes it there; an `id:` given overrides the file
        and is written;
-    2. sets aside the working copies left under `<dir>/flights/`
-       (`Aerotow.Copies.at_start/1`), so no launch trips over one;
+    2. sets aside the working copies left under `<dir>/flights/` that can
+       never be carried (`Aerotow.Copies.at_start/1`);
     3. records in the catalog that nothing is aloft here any more;
     4. makes each store with `Aerotow.Store.new/3`, all at once, giving each
        #{div(10_000, 1000)} s; a store that cannot be made is kept as
        unavailable, with its reason, and tried again with a backoff from
        1 s doubling to 60 s;
-    5. makes the instance findable (`Aerotow.Instance.put/1`).
+    5. judges the copies left under `flights/` against their stores, and
+       sets aside those that cannot be carried (`Aerotow.Recovery.settle/1`);
+    6. makes the instance findable (`Aerotow.Instance.put/1`).
 
-  Then every available store is scanned, and again every `scan_interval`.
+  Then, in a task, the copies that can be carried are carried into their
+  next flights (R15, `Aerotow.Recovery.sweep/1`), and every available store
+  is scanned. Every `scan_interval` the stores are scanned again and the
+  copies and orphans that can be carried are; so they are when a store that
+  was unavailable becomes available. A retention pass
+  (`Aerotow.Retention.run/1`) runs every `Aerotow.Retention.interval/1`.
 
   ## The table
 
@@ -44,14 +51,14 @@ defmodule Aerotow.Server do
   Then every flight here is landed, all at once, for at most
   #{div(30_000, 1000)} s. A flight that has not landed by then is stopped
   with the rest of the tree; its working copy stays on disk, and the next
-  start sets it aside.
+  start carries it into the next flight, or sets it aside.
   """
 
   use GenServer
 
   require Logger
 
-  alias Aerotow.{Catalog, Copies, Flight, Instance, Options, Scan, Store}
+  alias Aerotow.{Catalog, Copies, Flight, Instance, Options, Recovery, Retention, Scan, Store}
 
   @connect_timeout 10_000
   @land_bound 30_000
@@ -249,7 +256,10 @@ defmodule Aerotow.Server do
         reservations: %{},
         pending: :queue.new(),
         evicting: nil,
-        purges: %{}
+        purges: %{},
+        sweeping: nil,
+        sweep_again: false,
+        retaining: nil
       }
 
       state =
@@ -257,6 +267,7 @@ defmodule Aerotow.Server do
         |> Enum.with_index()
         |> connect_all(state)
 
+      Recovery.settle(instance)
       :ok = Instance.put(instance)
       {:ok, state, {:continue, :started}}
     else
@@ -266,8 +277,9 @@ defmodule Aerotow.Server do
 
   @impl true
   def handle_continue(:started, state) do
-    state = start_scans(state, available_names(state), nil)
+    state = state |> sweep() |> start_scans(available_names(state), nil)
     schedule_scan(state.instance)
+    schedule_retention(state.instance)
     {:noreply, state}
   end
 
@@ -526,7 +538,19 @@ defmodule Aerotow.Server do
 
   def handle_info(:scan_timer, state) do
     schedule_scan(state.instance)
-    {:noreply, start_scans(state, available_names(state), nil)}
+    {:noreply, state |> sweep() |> start_scans(available_names(state), nil)}
+  end
+
+  def handle_info(:retention_timer, state) do
+    schedule_retention(state.instance)
+
+    if state.retaining do
+      {:noreply, state}
+    else
+      instance = state.instance
+      task = Task.Supervisor.async_nolink(instance.tasks, fn -> Retention.run(instance) end)
+      {:noreply, %{state | retaining: task.ref}}
+    end
   end
 
   def handle_info({ref, result}, state) when is_reference(ref) do
@@ -562,6 +586,13 @@ defmodule Aerotow.Server do
 
   defp task_done(state, ref, result) do
     cond do
+      state.sweeping == ref ->
+        state = %{state | sweeping: nil}
+        if state.sweep_again, do: sweep(%{state | sweep_again: false}), else: state
+
+      state.retaining == ref ->
+        %{state | retaining: nil}
+
       Map.has_key?(state.connecting, ref) ->
         name = Map.fetch!(state.connecting, ref)
         state = %{state | connecting: Map.delete(state.connecting, ref)}
@@ -591,7 +622,7 @@ defmodule Aerotow.Server do
 
       if match?({:ok, _}, result) do
         Logger.info("aerotow: store #{inspect(name)} is available")
-        start_scans(state, [name], nil)
+        state |> sweep() |> start_scans([name], nil)
       else
         state
       end
@@ -599,6 +630,20 @@ defmodule Aerotow.Server do
       _ -> state
     end
   end
+
+  # ------------------------------------------------------------------ recovery
+
+  # One sweep at a time; one asked for while one runs follows it.
+  defp sweep(%{sweeping: nil} = state) do
+    instance = state.instance
+    task = Task.Supervisor.async_nolink(instance.tasks, fn -> Recovery.sweep(instance) end)
+    %{state | sweeping: task.ref}
+  end
+
+  defp sweep(state), do: %{state | sweep_again: true}
+
+  defp schedule_retention(instance),
+    do: Process.send_after(self(), :retention_timer, Retention.interval(instance))
 
   # ------------------------------------------------------------------ scans
 

@@ -68,7 +68,9 @@ defmodule Aerotow do
     Forward,
     Instance,
     Options,
+    Orphans,
     Purge,
+    Recovery,
     Ref,
     Router,
     Server,
@@ -834,7 +836,8 @@ defmodule Aerotow do
         end
 
       {:ok, {:launch, store}} ->
-        start(instance, store, ref, :launch, pin, tries)
+        # An orphan of it whose flight is still the newest is carried (R15).
+        start(instance, store, ref, Recovery.intent(instance, store, ref), pin, tries)
 
       error ->
         error
@@ -843,7 +846,9 @@ defmodule Aerotow do
 
   # Starts a flight with room made for it. A copy left where the working
   # copy goes is dealt with (`Aerotow.Copies.found/4`) and the launch tried
-  # again; so is a flight of the same ref that was on its way down.
+  # again; so is a flight of the same ref that was on its way down. A carry
+  # that finds the glider's flight already started (a sweep carried it) waits
+  # for that flight; one that finds its copy superseded launches.
   defp start(instance, store, ref, intent, pin, tries) do
     with {:ok, token} <- Server.room(instance, ref) do
       result =
@@ -853,7 +858,14 @@ defmodule Aerotow do
 
       case result do
         {:ok, pid} ->
+          with {:carry, path} <- intent, do: Recovery.carried(path)
           {:ok, pid}
+
+        {:error, {:already_started, pid}} ->
+          with :ok <- Flight.await(pid, instance.launch_timeout), do: {:ok, pid}
+
+        {:error, {:launch, :superseded}} when tries > 1 and intent != :launch ->
+          start(instance, store, ref, :launch, pin, tries - 1)
 
         {:error, {:launch, {:copy_exists, path}}} when tries > 1 ->
           with {:ok, intent} <- left_behind(instance, store, ref, path, intent),
@@ -902,6 +914,28 @@ defmodule Aerotow do
     after
       timeout -> Process.demonitor(monitor, [:flush])
     end
+  end
+
+  # ------------------------------------------------------------------ orphans
+
+  @doc """
+  What is kept in `<dir>/orphans/`: working copies that may hold log that
+  never shipped, which no flight could carry (R14), oldest first. Each is
+  `%{id, ref, store, flight, when, why, bytes, path, carry}`, as
+  `Aerotow.Orphans` describes; `id` is what `discard_orphan/2` takes.
+  """
+  @spec orphans(tow()) :: {:ok, [Orphans.t()]} | {:error, reason()}
+  def orphans(tow) do
+    with {:ok, instance} <- instance(tow), do: {:ok, Orphans.list(instance)}
+  end
+
+  @doc """
+  Deletes the orphan `id`, as `orphans/1` lists it: the only way one is
+  deleted. `{:error, :not_found}` for an id that is not listed.
+  """
+  @spec discard_orphan(tow(), String.t()) :: :ok | {:error, reason()}
+  def discard_orphan(tow, id) do
+    with {:ok, instance} <- instance(tow), do: Orphans.discard(instance, id)
   end
 
   # ------------------------------------------------------------------ helpers
