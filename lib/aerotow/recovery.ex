@@ -36,7 +36,9 @@ defmodule Aerotow.Recovery do
       and nobody took off meanwhile.
 
   An orphan carried is moved out of `orphans/` into the flight: it is not
-  deleted, its data goes on in the new flight.
+  deleted, its data goes on in the new flight. A memory flight's replica
+  in `orphans/` is carried the same way: restored into the new flight (in
+  memory or to disk, as the card says now), and removed once it is up.
   """
 
   require Logger
@@ -147,11 +149,15 @@ defmodule Aerotow.Recovery do
   that glider opens and closes again. A copy locked by this very OS process
   belongs to a flight that was killed and whose handle has not been
   collected yet: everybody's garbage is collected and it is tried again for
-  about two seconds.
+  about two seconds. A memory flight's replica (`….replica`) opens when it
+  holds a whole base.
   """
   @spec opens(Path.t()) :: :ok | {:error, String.t()}
   def opens(path) do
     cond do
+      Copy.replica?(path) ->
+        Copy.replica_whole?(path)
+
       not match?({:ok, %File.Stat{type: :regular}}, File.lstat(path)) ->
         {:error, "#{path} is not a database file"}
 

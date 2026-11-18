@@ -39,6 +39,13 @@ defmodule Aerotow.Instance do
   | `scan_interval` | 60,000 ms | each store's cards are re-read this often; `nil` for never |
   | `retention` | 86,400,000 ms | older flights are deleted from a store after this |
   | `memory_threshold` | 64 MiB | under `mode: "auto"`, a glider smaller than this flies in memory |
+  | `mode` | `nil` | where every glider here holds its pages: `"auto"`, `"memory"` or `"disk"`, over its store's and its card's |
+  | `hot` | `nil` | bytes of hot set for every glider flown from disk here, over its store's and its card's |
+  | `max_memory` | 512 MiB | the most memory one glider flown in memory may use |
+  | `cache_size` | `nil` | the most page cache one glider flown from disk may use; `nil` is glider's default, the process's whole cache budget. A hot set is at most half of it |
+
+  `mode` and `hot` are left `nil` to let each store and each card say
+  (`Aerotow.Flight.Copy.decide/3` has the order).
   | `default_store` | `nil` | where `create/3` puts a glider that names no store |
   """
 
@@ -65,6 +72,10 @@ defmodule Aerotow.Instance do
             scan_interval: 60_000,
             retention: 86_400_000,
             memory_threshold: 64 * 1024 * 1024,
+            mode: nil,
+            hot: nil,
+            max_memory: 512 * 1024 * 1024,
+            cache_size: nil,
             default_store: nil
 
   @type timing :: %{ttl: pos_integer(), margin: pos_integer(), grace: non_neg_integer()}
@@ -92,6 +103,10 @@ defmodule Aerotow.Instance do
           scan_interval: pos_integer() | nil,
           retention: pos_integer(),
           memory_threshold: non_neg_integer(),
+          mode: String.t() | nil,
+          hot: non_neg_integer() | nil,
+          max_memory: pos_integer(),
+          cache_size: pos_integer() | nil,
           default_store: String.t() | nil
         }
 

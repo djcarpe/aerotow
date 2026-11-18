@@ -96,7 +96,8 @@ defmodule Aerotow.FailureTest do
       store = Path.join(dir, "store")
       a_dir = Path.join(dir, "a")
       peer = PeerTow.start()
-      a = PeerTow.tow(peer, peer_opts(:aerotow_restarted_a, a_dir, store))
+      # From disk: a memory flight's writes die with its VM.
+      a = PeerTow.tow(peer, peer_opts(:aerotow_restarted_a, a_dir, store) ++ [mode: "disk"])
 
       {:ok, _} = PeerTow.call(peer, Aerotow, :create, [a, @ref, []])
       {:ok, 1} = peer_write(peer, a, 1, sync: :commit)

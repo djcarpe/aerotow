@@ -185,7 +185,8 @@ defmodule Aerotow.RecoveryTest do
 
     test "R15: a flight that is killed is launched again by the next statement from its copy: nothing is lost",
          %{tmp_dir: dir} do
-      a = start_a(Path.join(dir, "a"), Path.join(dir, "store"))
+      # From disk: a memory flight killed has no copy (Aerotow.FlightTest, 17).
+      a = start_a(Path.join(dir, "a"), Path.join(dir, "store"), mode: "disk")
       {:ok, _} = Aerotow.create(a, @ref)
       {:ok, 1} = write(a, 1, sync: :commit)
       {:ok, 1} = write(a, 2)
@@ -298,7 +299,9 @@ defmodule Aerotow.RecoveryTest do
         tow(Path.join(dir, "a"),
           stores: [{"store", Path.join(dir, "store")}],
           default_store: "store",
-          max_aloft: 1
+          max_aloft: 1,
+          # A working copy on disk has bytes from the start; an empty graph in memory has none.
+          mode: "disk"
         )
 
       listen([[:aerotow, :evict]])

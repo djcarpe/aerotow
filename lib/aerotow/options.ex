@@ -30,9 +30,10 @@ defmodule Aerotow.Options do
         }
 
   @known ~w(name dir stores default_store id clock timing url sync_interval sync_timeout
-            launch_timeout idle max_aloft budget scan_interval retention memory_threshold)a
+            launch_timeout idle max_aloft budget scan_interval retention memory_threshold
+            mode hot max_memory cache_size)a
 
-  @positive ~w(sync_interval sync_timeout launch_timeout max_aloft retention)a
+  @positive ~w(sync_interval sync_timeout launch_timeout max_aloft retention max_memory)a
   @id ~r/\A[0-9a-f]{32}\z/
 
   @doc """
@@ -151,6 +152,9 @@ defmodule Aerotow.Options do
       budget: &optional_positive(&1, :budget),
       scan_interval: &optional_positive(&1, :scan_interval),
       memory_threshold: &memory_threshold/1,
+      cache_size: &optional_positive(&1, :cache_size),
+      mode: &mode/1,
+      hot: &hot/1,
       default_store: &default_store(&1, stores)
     ]
 
@@ -211,6 +215,30 @@ defmodule Aerotow.Options do
 
   defp memory_threshold(other),
     do: {:error, "memory_threshold is a number of bytes, got: #{inspect(other)}"}
+
+  @doc """
+  Checks a `mode:` given to an instance or a store: `nil` (no opinion),
+  or `"auto"`, `"memory"` or `"disk"`, as a string or an atom.
+
+      iex> Aerotow.Options.mode(:memory)
+      {:ok, "memory"}
+  """
+  @spec mode(term()) :: {:ok, String.t() | nil} | {:error, String.t()}
+  def mode(nil), do: {:ok, nil}
+  def mode(mode) when mode in [:auto, :memory, :disk], do: {:ok, Atom.to_string(mode)}
+  def mode(mode) when mode in ["auto", "memory", "disk"], do: {:ok, mode}
+
+  def mode(other),
+    do: {:error, "mode is \"auto\", \"memory\" or \"disk\", got: #{inspect(other)}"}
+
+  @doc """
+  Checks a `hot:` given to an instance or a store: `nil` (no opinion), or
+  the bytes of hot set to keep; `0` is no hot set.
+  """
+  @spec hot(term()) :: {:ok, non_neg_integer() | nil} | {:error, String.t()}
+  def hot(nil), do: {:ok, nil}
+  def hot(n) when is_integer(n) and n >= 0, do: {:ok, n}
+  def hot(other), do: {:error, "hot is a number of bytes or nil, got: #{inspect(other)}"}
 
   defp default_store(nil, _stores), do: {:ok, nil}
 

@@ -61,9 +61,11 @@ Erlang distribution or HTTP through `Aerotow.Plug`), carrying a working copy
 left behind into the next flight, orphans, and retention. Every row of the
 design's "What can go wrong" table has a test.
 
-Not yet: flying a glider in memory, or from disk with a hot set. The engine
-has both (glider's in-memory replication and hot set); aerotow does not use
-them yet.
+A glider flies in memory, from disk, or from disk with a hot set, as its
+card, its store or the instance says (`mode:`, `hot:`); under `"auto"`, the
+default, one smaller than `memory_threshold` flies in memory. The replica
+in the store is the same either way, so a glider can fly in memory on one
+flight and from disk on the next.
 
 ## Build
 
