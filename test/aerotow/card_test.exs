@@ -154,30 +154,42 @@ defmodule Aerotow.CardTest do
 
     test "garbage in any field is an error or a default, never a crash and never an atom" do
       ok = full() |> Card.encode() |> JSON.decode!()
-      before = :erlang.system_info(:atom_count)
+
+      # Strings no code has ever named: if decoding made an atom of one, it
+      # would exist afterwards. Asking about these, rather than counting the
+      # VM's atoms, is not upset by whatever else the VM is doing meanwhile.
+      word = "zz-not-an-atom-#{System.unique_integer([:positive])}"
+      key = "zz-not-a-key-#{System.unique_integer([:positive])}"
+      nested = "zz-not-nested-#{System.unique_integer([:positive])}"
 
       junk = [
         nil,
         true,
         -1,
         1.5,
-        "zz-not-an-atom-#{System.unique_integer()}",
+        word,
+        [word],
         [],
         [1],
         [[1]],
         %{},
-        %{"a" => %{"b" => 1}},
+        %{nested => %{nested => 1}},
+        [%{"name" => word, "count" => 1}],
         [%{"name" => 1}]
       ]
 
-      for {key, _} <- ok, value <- junk do
-        case Card.decode(JSON.encode!(Map.put(ok, key, value))) do
+      for {field, _} <- ok, value <- junk do
+        case Card.decode(JSON.encode!(Map.put(ok, field, value))) do
           {:ok, %Card{}} -> :ok
           {:error, reason} when is_binary(reason) -> :ok
         end
       end
 
-      assert :erlang.system_info(:atom_count) == before
+      assert {:ok, _} = Card.decode(JSON.encode!(Map.put(ok, key, word)))
+
+      for s <- [word, key, nested] do
+        assert_raise ArgumentError, fn -> String.to_existing_atom(s) end
+      end
     end
 
     test "counts that are not counts are refused" do
