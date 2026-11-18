@@ -4,10 +4,11 @@ defmodule Aerotow.Router do
   place that decides.
 
       1. aloft here                       → here
-      2. home is a peer store             → the peer (forwarding is the peer slice's)
+      2. home is a peer store             → the peer (`Aerotow.Forward`)
       3. home is a file store             → launch here (open in place)
       4. home is a dir or s3 store
-         current flight active, not ours  → aloft elsewhere, with its holder
+         current flight active, not ours  → aloft elsewhere, with its holder,
+                                            to forward to (`Aerotow.Forward`)
          otherwise                        → launch here
 
   The home comes from the catalog. A ref the catalog does not know is
@@ -68,17 +69,18 @@ defmodule Aerotow.Router do
   end
 
   @doc """
-  Where a statement for `ref` runs: `{:here, pid}`, `{:launch, store}`, or
-  why it cannot run here. A glider homed in a peer store is
-  `{:error, :peer_not_supported}` until the peer slice forwards to it; one
-  aloft on another instance is `{:error, {:aloft_elsewhere, holder}}`.
+  Where the glider is open for a call that runs where it is open:
+  `{:here, pid}`, `{:launch, store}`, or why it is not open here. A glider
+  homed in a peer store is `{:error, {:runs_on_peer, store}}`; one aloft on
+  another instance is `{:error, {:aloft_elsewhere, holder}}`. A call that
+  can be sent there instead is, by `Aerotow` with `Aerotow.Forward`.
   """
   @spec route(Instance.t(), Ref.t()) ::
           {:ok, {:here, pid()} | {:launch, Store.t()}}
-          | {:error, reason() | :peer_not_supported | {:aloft_elsewhere, holder()}}
+          | {:error, reason() | {:runs_on_peer, String.t()} | {:aloft_elsewhere, holder()}}
   def route(instance, ref) do
     case locate(instance, ref) do
-      {:ok, {:peer, _store}} -> {:error, :peer_not_supported}
+      {:ok, {:peer, store}} -> {:error, {:runs_on_peer, store.name}}
       {:ok, {:elsewhere, holder}} -> {:error, {:aloft_elsewhere, holder}}
       other -> other
     end

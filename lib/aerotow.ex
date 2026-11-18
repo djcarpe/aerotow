@@ -43,10 +43,18 @@ defmodule Aerotow do
   ## Where a statement runs
 
   `Aerotow.Router` decides: on the flight here when the glider is aloft
-  here; launched here when it is hangared; refused with `{:error,
-  {:aloft_elsewhere, holder}}` when another instance holds its flight. A
-  statement runs in the calling process, with the handle the flight lends
-  it, so a long query never holds up anything else.
+  here; launched here when it is hangared; forwarded to the peer when the
+  glider is homed in a `peer` store; forwarded to the holder when another
+  instance holds its flight, and refused with `{:error, {:aloft_elsewhere,
+  holder}}` when the holder cannot be reached (`Aerotow.Forward`). A
+  statement that runs here runs in the calling process, with the handle the
+  flight lends it, so a long query never holds up anything else.
+
+  `query/5`, `run/5`, `write_batch/4`, `context/3`, `schema/2`, `stats/2`,
+  `card/2`, `update/3`, `delete/3` and `create/3` are forwarded that way.
+  `checkout/4`, `launch/3` and `describe/2` run here only: for a glider
+  homed in a peer they are `{:error, {:runs_on_peer, store}}`, and for one
+  aloft elsewhere `{:error, {:aloft_elsewhere, holder}}`.
 
   Results are glider_ex's own: `{:ok, %Glider.Result{}}` from `query/5`,
   `{:ok, touched}` from `run/5`.
@@ -57,6 +65,7 @@ defmodule Aerotow do
     Catalog,
     Copies,
     Flight,
+    Forward,
     Instance,
     Options,
     Purge,
@@ -80,8 +89,16 @@ defmodule Aerotow do
     * `:not_aloft` - `land/2` or `sync/2` of a glider not aloft here
     * `{:aloft_elsewhere, holder}` - another instance holds the glider's
       flight; `holder` is `%{holder: id, node: node, url: url, flight: n}`
-    * `:peer_not_supported` - the glider is homed in a peer store, which
-      this build does not forward to yet
+    * `{:runs_on_peer, store}` - the glider is homed in the peer store
+      `store`, and the call runs only where the glider is open
+      (`checkout/4`, `launch/3`, `describe/2`): it runs there
+    * `:too_many_hops` - the call was forwarded more than three times
+      (`Aerotow.Forward`)
+    * `{:peer_unavailable, where, reason}` - the peer or holder a call was
+      forwarded to could not answer it (`where` is a peer store's name or a
+      node's)
+    * `{:outcome_unknown, where, reason}` - a write was forwarded and its
+      answer was lost: it may or may not have been applied
     * `{:store_unavailable, name, reason}` - its store cannot be reached now
     * `:too_many_aloft` - there is no room for another flight here, and no
       flight could land to make it
@@ -100,7 +117,10 @@ defmodule Aerotow do
           | :exists
           | :not_aloft
           | {:aloft_elsewhere, Router.holder()}
-          | :peer_not_supported
+          | {:runs_on_peer, String.t()}
+          | :too_many_hops
+          | {:peer_unavailable, String.t(), String.t()}
+          | {:outcome_unknown, String.t(), String.t()}
           | {:store_unavailable, String.t(), String.t()}
           | :too_many_aloft
           | :purging
@@ -247,6 +267,9 @@ defmodule Aerotow do
   `links:`, `mode:` and `hot:`. It is left aloft here, and lands when idle.
   A ref that exists anywhere a store can tell (this catalog, or a card in
   any store that can be reached) is `{:error, :exists}`.
+
+  With a `peer` store for `store:`, the peer creates it, in its own default
+  store, and its card comes into this catalog homed in the peer store.
   """
   @spec create(tow(), Ref.t(), keyword()) :: {:ok, Card.t()} | {:error, reason()}
   def create(tow, ref, opts \\ []), do: new_glider(tow, ref, opts, nil)
@@ -276,8 +299,17 @@ defmodule Aerotow do
          :ok <- nowhere(instance, ref) do
       intent = if from, do: {:adopt, card, from}, else: {:create, card}
 
-      with {:ok, pid} <- start(instance, store, ref, intent, false, @tries) do
-        {:ok, Flight.card(pid)}
+      cond do
+        store.kind != :peer ->
+          with {:ok, pid} <- start(instance, store, ref, intent, false, @tries) do
+            {:ok, Flight.card(pid)}
+          end
+
+        from == nil ->
+          Forward.to_peer(instance, store, {:create, ref, card_opts})
+
+        true ->
+          {:error, {:runs_on_peer, store.name}}
       end
     end
   end
@@ -289,12 +321,7 @@ defmodule Aerotow do
     end
   end
 
-  defp home_for(instance, name) do
-    case Server.store(instance, name) do
-      {:ok, %Store{kind: :peer}} -> {:error, :peer_not_supported}
-      other -> other
-    end
-  end
+  defp home_for(instance, name), do: Server.store(instance, name)
 
   # A ref is new only where nothing can tell of it: not in the catalog, not
   # aloft here, and no card in any store that answers.
@@ -322,9 +349,11 @@ defmodule Aerotow do
   """
   @spec update(tow(), Ref.t(), keyword() | map()) :: {:ok, Card.t()} | {:error, reason()}
   def update(tow, ref, changes) do
-    with {:ok, instance} <- instance(tow),
-         {:ok, pid} <- flight(instance, ref, false) do
-      Flight.update_card(pid, changes)
+    with {:ok, instance} <- instance(tow) do
+      case flight(instance, ref, false) do
+        {:ok, pid} -> Flight.update_card(pid, changes)
+        error -> forward(instance, error, {:update, ref, changes})
+      end
     end
   end
 
@@ -342,8 +371,9 @@ defmodule Aerotow do
   end
 
   @doc """
-  A glider's card: the flight's, when it is aloft here; otherwise the
-  catalog's, or on a miss the first store's that has one (R3).
+  A glider's card: the flight's, when it is aloft here; the peer's, asked
+  now, when it is homed in a peer store; otherwise the catalog's, or on a
+  miss the first store's that has one (R3).
   """
   @spec card(tow(), Ref.t()) :: {:ok, Card.t()} | {:error, reason()}
   def card(tow, ref) do
@@ -357,7 +387,12 @@ defmodule Aerotow do
           end
 
         [] ->
-          Router.card(instance, ref)
+          with {:ok, card} <- Router.card(instance, ref) do
+            case Server.store(instance, card.store) do
+              {:ok, %Store{kind: :peer} = peer} -> Forward.to_peer(instance, peer, {:card, ref})
+              _ -> {:ok, card}
+            end
+          end
       end
     end
   end
@@ -369,6 +404,9 @@ defmodule Aerotow do
   flight of it here has landed; the store keeps it, and a scan brings it
   back. With `purge: true` it is deleted from its store, as
   `Aerotow.Purge` describes, and is `:not_found` everywhere afterwards.
+
+  A glider homed in a peer store is deleted by the peer, as it would be by
+  this call there, and forgotten here.
   """
   @spec delete(tow(), Ref.t(), keyword()) :: :ok | {:error, reason()}
   def delete(tow, ref, opts \\ []) do
@@ -376,9 +414,26 @@ defmodule Aerotow do
          {:ok, ref} <- Ref.parse(ref),
          :ok <- keyword(opts),
          :ok <- known_options(opts, [:purge]) do
-      if Keyword.get(opts, :purge, false) == true,
-        do: Purge.run(instance, ref),
-        else: forget(instance, ref)
+      purge = Keyword.get(opts, :purge, false) == true
+
+      case peer_home(instance, ref) do
+        {:ok, peer} ->
+          with {:ok, :ok} <- Forward.to_peer(instance, peer, {:delete, ref, [purge: purge]}),
+               do: :ok
+
+        :no ->
+          if purge, do: Purge.run(instance, ref), else: forget(instance, ref)
+      end
+    end
+  end
+
+  # The peer store a glider is homed in, by the catalog.
+  defp peer_home(instance, ref) do
+    with {:ok, card} <- Catalog.card(instance.catalog, ref),
+         {:ok, %Store{kind: :peer} = peer} <- Server.store(instance, card.store) do
+      {:ok, peer}
+    else
+      _ -> :no
     end
   end
 
@@ -483,7 +538,10 @@ defmodule Aerotow do
         graph: Keyword.get(opts, :graph, false)
       ]
 
-      statement(tow, ref, :query, :read, opts, fn db ->
+      forwarded =
+        {:query, ref, cypher, params, Keyword.take(opts, [:max_rows, :max_bytes, :graph])}
+
+      statement(tow, ref, :query, :read, opts, forwarded, fn db ->
         Glider.query(db, cypher, params, bounds)
       end)
     end
@@ -502,7 +560,8 @@ defmodule Aerotow do
          :ok <- known_options(opts, @run_options),
          :ok <- Statement.check_run(cypher) do
       mode = if Statement.classify(cypher) == :write, do: :write, else: :read
-      statement(tow, ref, :run, mode, opts, &Glider.run(&1, cypher, params))
+      forwarded = {:run, ref, cypher, params, Keyword.take(opts, [:sync])}
+      statement(tow, ref, :run, mode, opts, forwarded, &Glider.run(&1, cypher, params))
     end
   end
 
@@ -516,7 +575,11 @@ defmodule Aerotow do
     with :ok <- keyword(opts),
          :ok <- known_options(opts, @run_options),
          :ok <- batch(statements) do
-      statement(tow, ref, :write_batch, :write, opts, &Glider.write_batch(&1, statements))
+      forwarded = {:write_batch, ref, statements, Keyword.take(opts, [:sync])}
+
+      statement(tow, ref, :write_batch, :write, opts, forwarded, fn db ->
+        Glider.write_batch(db, statements)
+      end)
     end
   end
 
@@ -545,17 +608,23 @@ defmodule Aerotow do
     with :ok <- keyword(opts) do
       {timeout, opts} = Keyword.pop(opts, :timeout)
       run_opts = if timeout, do: [timeout: timeout], else: []
-      statement(tow, ref, :context, :read, run_opts, &Glider.Context.retrieve(&1, opts))
+      forwarded = {:context, ref, opts}
+
+      statement(tow, ref, :context, :read, run_opts, forwarded, fn db ->
+        Glider.Context.retrieve(db, opts)
+      end)
     end
   end
 
   @doc "The glider's schema, as `Glider.schema/1`."
   @spec schema(tow(), Ref.t()) :: {:ok, map()} | {:error, reason()}
-  def schema(tow, ref), do: statement(tow, ref, :schema, :read, [], &Glider.schema/1)
+  def schema(tow, ref),
+    do: statement(tow, ref, :schema, :read, [], {:schema, ref}, &Glider.schema/1)
 
   @doc "The glider's stats, as `Glider.stats/1`."
   @spec stats(tow(), Ref.t()) :: {:ok, map()} | {:error, reason()}
-  def stats(tow, ref), do: statement(tow, ref, :stats, :read, [], &Glider.stats/1)
+  def stats(tow, ref),
+    do: statement(tow, ref, :stats, :read, [], {:stats, ref}, &Glider.stats/1)
 
   @doc """
   `fun.(db)` with the glider's open handle, in the calling process, here
@@ -570,20 +639,25 @@ defmodule Aerotow do
   def checkout(tow, ref, fun, opts \\ []) when is_function(fun, 1) do
     with :ok <- keyword(opts),
          :ok <- known_options(opts, @run_options) do
-      statement(tow, ref, :checkout, :write, opts, &{:ok, fun.(&1)})
+      statement(tow, ref, :checkout, :write, opts, nil, &{:ok, fun.(&1)})
     end
   end
 
   # Routes, launches when it has to, and runs `fun` in this process with the
   # handle lent. `fun` answers {:ok, _} or {:error, _}, which is the answer.
-  defp statement(tow, ref, op, mode, opts, fun) do
+  # A glider homed in a peer, or aloft elsewhere, gets `forwarded` sent to
+  # the instance that answers for it (`Aerotow.Forward`); with `forwarded`
+  # nil (a checkout) it is refused instead.
+  defp statement(tow, ref, op, mode, opts, forwarded, fun) do
     with {:ok, instance} <- instance(tow),
          {:ok, ref} <- Ref.parse(ref) do
       # Aloft here, the statement goes straight to the flight, which holds
       # it while it is still launching; only a launch waits for the flight.
       placed =
-        case Router.route(instance, ref) do
+        case Router.locate(instance, ref) do
           {:ok, {:here, pid}} -> {:ok, pid}
+          {:ok, {:peer, store}} -> {:peer, store}
+          {:ok, {:elsewhere, holder}} -> {:error, {:aloft_elsewhere, holder}}
           routed -> fly(instance, ref, routed, false, @tries)
         end
 
@@ -593,17 +667,37 @@ defmodule Aerotow do
             lend(instance, ref, pid, mode, opts, fun, @tries)
           end)
 
-        {:error, {:aloft_elsewhere, _}} = error ->
-          span(%{ref: ref, op: op, where: :elsewhere}, fn -> error end)
+        {:error, {:aloft_elsewhere, holder}} = error ->
+          span(%{ref: ref, op: op, where: :elsewhere}, fn ->
+            if forwarded, do: Forward.to_holder(instance, holder, forwarded), else: error
+          end)
 
-        {:error, :peer_not_supported} = error ->
-          span(%{ref: ref, op: op, where: :peer}, fn -> error end)
+        {:peer, store} ->
+          span(%{ref: ref, op: op, where: :peer}, fn ->
+            if forwarded,
+              do: Forward.to_peer(instance, store, forwarded),
+              else: {:error, {:runs_on_peer, store.name}}
+          end)
 
         error ->
           error
       end
     end
   end
+
+  # A call that runs where the glider is open, sent there: to the peer it
+  # is homed in, or to the holder of its flight.
+  defp forward(instance, {:error, {:runs_on_peer, name}} = error, request) do
+    case Server.store(instance, name) do
+      {:ok, %Store{kind: :peer} = peer} -> Forward.to_peer(instance, peer, request)
+      _ -> error
+    end
+  end
+
+  defp forward(instance, {:error, {:aloft_elsewhere, holder}}, request),
+    do: Forward.to_holder(instance, holder, request)
+
+  defp forward(_instance, error, _request), do: error
 
   defp lend(instance, ref, pid, mode, opts, fun, tries) do
     run_opts = Keyword.take(opts, [:timeout, :sync])

@@ -116,7 +116,8 @@ defmodule Aerotow.RouterTest do
       assert rows(Aerotow.query(tow, @ref, "MATCH (n:N) RETURN n.n")) == [[1]]
     end
 
-    test "a glider homed in a peer store is not run here: :peer_not_supported", %{tow: tow} do
+    test "a glider homed in a peer store is not opened here: what runs where it is open says it runs on the peer",
+         %{tow: tow} do
       instance = instance!(tow)
 
       peer = %Store{
@@ -131,10 +132,11 @@ defmodule Aerotow.RouterTest do
       {:ok, card} = Card.new("west/thing")
       :ok = Catalog.put_card(instance.catalog, %{card | store: "west"})
 
-      assert Aerotow.query(tow, "west/thing", "STATS") == {:error, :peer_not_supported}
-      assert Aerotow.run(tow, "west/thing", "CREATE (:N)") == {:error, :peer_not_supported}
+      assert Aerotow.checkout(tow, "west/thing", & &1) == {:error, {:runs_on_peer, "west"}}
+      assert Aerotow.launch(tow, "west/thing") == {:error, {:runs_on_peer, "west"}}
+      assert Aerotow.describe(tow, "west/thing") == {:error, {:runs_on_peer, "west"}}
       assert Aerotow.where(tow, "west/thing") == {:ok, {:peer, "west"}}
-      assert Aerotow.create(tow, "west/new", store: "west") == {:error, :peer_not_supported}
+      assert {:ok, []} = Aerotow.aloft(tow)
     end
 
     test "a glider homed in a store that cannot be reached is :store_unavailable", %{tow: tow} do
