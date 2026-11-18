@@ -50,7 +50,7 @@ defmodule Aerotow.Card do
   # Property names the catalog uses on a :Glider node. An attr may not take one.
   @reserved ~w(ref namespace name description tags links mode hot nodes edges bytes
                labels types indexes extensions schema text flight generation position
-               aloft known store created_at updated_at described_at format attrs)
+               aloft known store created_at updated_at described_at format attrs attr_names)
 
   @tag ~r/\A[a-z0-9](?:[a-z0-9._:-]{0,62})\z/
   @attr_key ~r/\A[a-z][a-z0-9_]{0,62}\z/

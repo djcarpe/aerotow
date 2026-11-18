@@ -405,12 +405,25 @@ Results are glider_ex's own: `{:ok, %Glider.Result{}}`, `{:ok, touched}`,
 
 `query/5` takes only statements that provably read: `MATCH … RETURN`,
 `CALL` of a built-in algorithm with no `write:`, the `context` extension's
-reading procedures, `STATS`, `SCHEMA`, `SHOW EXTENSIONS`, `HELP`, `EXPLAIN`.
-Anything else is refused with a message naming `run/5` (R17). The check
-(`Aerotow.Statement`) reads tokens, so a keyword inside a string, after `.`
-or after `:` is not a statement. `find/3` applies the same check to the
-catalog. `checkout/4` runs here only: with the glider aloft elsewhere it
-returns `{:error, {:aloft_elsewhere, holder}}`.
+reading procedures, `STATS`, `SCHEMA`, `SHOW EXTENSIONS`, `HELP`, and
+`EXPLAIN` of any of those. Anything else is refused with a message naming
+`run/5` (R17). The check (`Aerotow.Statement`) follows glider's own lexer
+and grammar, so a keyword inside a string, after `.` or after `:` is not a
+statement, while a name in backticks is a keyword wherever glider would
+read one; whatever it cannot place is a write. `find/3` applies the same
+check to the catalog.
+
+`run/5` and `write_batch/3` refuse `BEGIN`, `COMMIT` and `ROLLBACK`: sent
+as text, they turn autocommit off for the whole handle, behind the backs of
+every other caller. A transaction is `checkout/4` with
+`Glider.transaction/2`. `checkout/4` runs here only: with the glider aloft
+elsewhere it returns `{:error, {:aloft_elsewhere, holder}}`.
+
+Statements are untrusted input. Before glider's `fix/bounded-depth` (#11)
+a statement nested about 120 deep overflowed the stack and took the whole
+VM down with it. Aerotow pins a glider with that fix: nesting deeper than
+64 levels is an error, and flat chains (`AND`, `OR`, `+`, comma patterns)
+are limited only by size. `Aerotow.Statement` counts depth as glider does.
 
 ## Peers
 
