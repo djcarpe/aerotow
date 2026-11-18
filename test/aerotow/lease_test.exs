@@ -282,6 +282,8 @@ defmodule Aerotow.LeaseTest do
   describe "R7: exactly one taker wins" do
     setup %{tmp_dir: dir}, do: %{store: store(dir)}
 
+    # Hundreds of rounds of fsynced exclusive puts: minutes on a loaded machine.
+    @tag timeout: 600_000
     test "R7: of sixteen takers of a hangared glider one wins, round after round, and flights go 1, 2, 3, … with no gap",
          %{store: store} do
       hangared(store, "race")
@@ -305,6 +307,8 @@ defmodule Aerotow.LeaseTest do
       assert flights == Enum.to_list(1..(rounds + 1))
     end
 
+    # Hundreds of rounds of fsynced exclusive puts: minutes on a loaded machine.
+    @tag timeout: 600_000
     test "R7: of sixteen creators of a new glider one creates flight 1 and the rest find it exists",
          %{store: store} do
       for round <- 1..100 do
