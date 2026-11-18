@@ -6,14 +6,10 @@ if Code.ensure_loaded?(Plug) do
 
         forward "/aerotow", Aerotow.Plug, tow: MyApp.Aerotow, tokens: [token]
 
-    > #### Mount it only on an engine that bounds a statement's depth {: .warning}
-    >
-    > Glider before `fix/bounded-depth` parses and evaluates a statement
-    > recursively, and one nested about 120 levels deep overflows the
-    > native stack and takes the whole VM down with it. Anyone with a
-    > token can send a statement here, and `Aerotow.Statement` only bounds
-    > the depth of statements it takes as reads: a `run` goes to glider as
-    > it came. Mount this plug only on a build whose glider has that fix.
+    Statements that arrive here are untrusted input. The glider aerotow pins
+    (djcarpe/glider `7aed281`, with its `fix/bounded-depth`) refuses one nested
+    deeper than 64 levels with an error instead of overflowing the stack, so a
+    `run` sent with a token cannot take the VM down. An older glider could.
 
     `:plug` is an optional dependency of aerotow: this module exists only
     when Plug is there, and nothing else in aerotow needs it.

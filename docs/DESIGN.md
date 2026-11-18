@@ -419,11 +419,11 @@ every other caller. A transaction is `checkout/4` with
 `Glider.transaction/2`. `checkout/4` runs here only: with the glider aloft
 elsewhere it returns `{:error, {:aloft_elsewhere, holder}}`.
 
-Statements are untrusted input. Glider's parser and evaluator recurse, and
-before glider's `fix/bounded-depth` a statement nested about 120 deep
-overflowed the stack and took the whole VM down with it. Aerotow pins a
-glider that refuses such a statement with an error, and nothing in aerotow
-sends one to an older engine.
+Statements are untrusted input. Before glider's `fix/bounded-depth` (#11)
+a statement nested about 120 deep overflowed the stack and took the whole
+VM down with it. Aerotow pins a glider with that fix: nesting deeper than
+64 levels is an error, and flat chains (`AND`, `OR`, `+`, comma patterns)
+are limited only by size. `Aerotow.Statement` counts depth as glider does.
 
 ## Peers
 

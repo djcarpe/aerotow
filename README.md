@@ -50,22 +50,20 @@ tow = MyApp.Aerotow
 
 ## Status
 
-Being built, against [docs/DESIGN.md](docs/DESIGN.md), which is the contract:
-the catalog's schema, the layout of a store, how a flight leases a glider,
-where a statement runs, the protocol between aerotows, and what can go wrong.
-Its last section is the build plan.
+Built against [docs/DESIGN.md](docs/DESIGN.md), which is the contract: the
+catalog's schema, the layout of a store, how a flight leases a glider, where
+a statement runs, the protocol between aerotows, and what can go wrong.
 
-What runs today: one instance (`{Aerotow, opts}`) over `file`, `dir` and `s3`
-stores, with the catalog, scans, flights (leases, shipping, landing) and the
-whole interface of the design's table except forwarding. The example above
-runs, with a `dir` or `s3` store in place of the peer: a glider homed in a
-peer store answers `{:error, :peer_not_supported}`, and one aloft on another
-instance answers `{:error, {:aloft_elsewhere, holder}}`.
+What runs: instances over `file`, `dir`, `s3` and `peer` stores, with the
+catalog, scans, flights (leases, shipping, landing), the whole interface of
+the design's table, forwarding to the instance that holds a glider (over
+Erlang distribution or HTTP through `Aerotow.Plug`), carrying a working copy
+left behind into the next flight, orphans, and retention. Every row of the
+design's "What can go wrong" table has a test.
 
-Not yet: forwarding to another aerotow over HTTP or Erlang distribution
-(`Aerotow.Plug`, the peer store), carrying a working copy left behind into a
-new flight (such copies are kept in `orphans/`), retention of old flights,
-and memory flights.
+Not yet: flying a glider in memory, or from disk with a hot set. The engine
+has both (glider's in-memory replication and hot set); aerotow does not use
+them yet.
 
 ## Build
 
