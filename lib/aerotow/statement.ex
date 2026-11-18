@@ -150,6 +150,60 @@ defmodule Aerotow.Statement do
   end
 
   @doc """
+  Whether `statement` is `BEGIN`, `COMMIT` or `ROLLBACK`, as glider would
+  read it: in any case, after comments, `;` or whitespace, in backticks, or
+  after `EXPLAIN`. Sent as text, these turn autocommit off or on for the
+  whole handle, behind the backs of every other caller, so `Aerotow.run/5`
+  and `Aerotow.write_batch/4` refuse them; a transaction is
+  `Aerotow.checkout/4` with `Glider.transaction/2`.
+
+      iex> Aerotow.Statement.transaction?("  // open one\\n begin")
+      true
+
+      iex> Aerotow.Statement.transaction?("MATCH (begin) RETURN begin")
+      false
+  """
+  @spec transaction?(term()) :: boolean()
+  def transaction?(statement)
+      when is_binary(statement) and byte_size(statement) <= @max_bytes do
+    with true <- String.valid?(statement),
+         {:ok, toks} <- tokens(statement, true) do
+      case Enum.drop_while(toks, &(&1 == "explain")) do
+        [word | _] -> word in ~w(begin commit rollback)
+        [] -> false
+      end
+    else
+      _ -> false
+    end
+  end
+
+  def transaction?(_statement), do: false
+
+  @doc """
+  `:ok` for a statement `Aerotow.run/5` may send, which is any statement but
+  `BEGIN`, `COMMIT` and `ROLLBACK` (`transaction?/1`), or an error saying why
+  not.
+
+      iex> Aerotow.Statement.check_run("COMMIT")
+      {:error, "COMMIT, BEGIN and ROLLBACK are not taken as text: they would change the handle for every caller; use Aerotow.checkout/4 with Glider.transaction/2"}
+  """
+  @spec check_run(term()) :: :ok | {:error, String.t()}
+  def check_run(statement) do
+    cond do
+      not is_binary(statement) ->
+        {:error, "a statement is a string, got: #{inspect(statement, limit: 5)}"}
+
+      transaction?(statement) ->
+        {:error,
+         "COMMIT, BEGIN and ROLLBACK are not taken as text: they would change the handle " <>
+           "for every caller; use Aerotow.checkout/4 with Glider.transaction/2"}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
   The built-in algorithms this module knows, aliases included. A `CALL` of
   one of them reads unless it is given `write:`; a `CALL` of any other name
   is a write.
