@@ -59,6 +59,12 @@ defmodule Aerotow.StatementTest do
     "EXPLAIN MATCH (n:Person) WHERE n.name = 'Ada'",
     "EXPLAIN STATS",
     "EXPLAIN CALL pagerank()",
+    "EXPLAIN EXPLAIN MATCH (n) RETURN n",
+    "// a comment\nEXPLAIN MATCH (n) RETURN n",
+    "`EXPLAIN` MATCH (n) RETURN n",
+    ";EXPLAIN MATCH (n) RETURN n",
+    # the comment ends at "\n", and what follows it is an EXPLAIN
+    "//abcde CREATE (n {x: '\nEXPLAIN MATCH (m) RETURN m //'})",
     # case and whitespace
     "match (n) return n",
     "MaTcH (n:Person) ReTuRn n.name",
@@ -120,7 +126,8 @@ defmodule Aerotow.StatementTest do
     {"MATCH (n) RETURN n LIMIT $create", [create: 1]},
     {"MATCH (n {name: $name}) RETURN n", [name: "Ada"]},
     {"MATCH (a)-[*1..$hops]->(b) RETURN b", [hops: 2]},
-    {"CALL pagerank(top: $top)", [top: 2]}
+    {"CALL pagerank(top: $top)", [top: 2]},
+    {"EXPLAIN MATCH (n) WHERE n.name = $name RETURN n", [name: "Ada"]}
   ]
 
   # Writes, and statements glider would not take. `changes: true` marks the
@@ -173,13 +180,9 @@ defmodule Aerotow.StatementTest do
     {"ROLLBACK", []},
     {"EXPLAIN CREATE (n)", []},
     {"EXPLAIN MATCH (n) SET n.x = 1", []},
-    {"EXPLAIN EXPLAIN MATCH (n) RETURN n", []},
-    {"// a comment\nEXPLAIN MATCH (n) RETURN n", []},
-    {"//abcde CREATE (n {x: '\nEXPLAIN MATCH (m) RETURN m //'})", []},
-    {"`EXPLAIN` MATCH (n) RETURN n", []},
-    {";EXPLAIN MATCH (n) RETURN n", []},
-    {"EXPLAIN MATCH (n) WHERE n.name = $name RETURN n", params: [name: "Ada"]},
+    {"EXPLAIN EXPLAIN CREATE (n)", []},
     {"EXPLAIN", []},
+    {"EXPLAIN EXPLAIN", []},
     {"", []},
     {"   ", []},
     {"// only a comment", []},
@@ -392,12 +395,14 @@ defmodule Aerotow.StatementTest do
       assert Statement.classify("CALL `context.search`(query: 'x')") == :write
     end
 
-    test "R17: EXPLAIN reads as what it explains, and only when glider parses what follows it" do
+    test "R17: EXPLAIN reads as what it explains, however it is spelled" do
       assert Statement.classify("EXPLAIN MATCH (n) RETURN n") == :read
       assert Statement.classify("EXPLAIN CREATE (n)") == :write
-      assert Statement.classify("EXPLAIN EXPLAIN MATCH (n) RETURN n") == :write
-      assert Statement.classify("// first\nEXPLAIN MATCH (n) RETURN n") == :write
-      assert Statement.classify("EXPLAIN MATCH (n) WHERE n.x = $x RETURN n") == :write
+      assert Statement.classify("EXPLAIN EXPLAIN MATCH (n) RETURN n") == :read
+      assert Statement.classify("EXPLAIN EXPLAIN MATCH (n) SET n.x = 1") == :write
+      assert Statement.classify("// first\nEXPLAIN MATCH (n) RETURN n") == :read
+      assert Statement.classify("; `explain` MATCH (n) RETURN n") == :read
+      assert Statement.classify("EXPLAIN MATCH (n) WHERE n.x = $x RETURN n") == :read
     end
 
     test "read?/1 agrees with classify/1" do
@@ -438,6 +443,64 @@ defmodule Aerotow.StatementTest do
         assert message =~ kind
         assert message =~ "Aerotow.run/5"
       end
+    end
+  end
+
+  describe "transaction?/1" do
+    test "it is true where glider_ex refuses a statement as a transaction control, and after EXPLAIN" do
+      statements = [
+        "BEGIN",
+        "commit",
+        "RollBack",
+        "  // open one\n begin",
+        ";; \u{00A0}COMMIT;",
+        "`BEGIN`",
+        "`begin",
+        "begin(",
+        "BEGIN MATCH (n) RETURN n",
+        "BEGIN // later",
+        "EXPLAIN BEGIN",
+        "MATCH (begin) RETURN begin",
+        "beginning",
+        "begin_",
+        "begin1",
+        "begin\u{00E9}",
+        "BEG IN",
+        "` begin`",
+        "// BEGIN",
+        "/* */ BEGIN",
+        "'BEGIN'",
+        "\u{212A}BEGIN",
+        ""
+      ]
+
+      with_db(fn db ->
+        for statement <- statements do
+          refused? =
+            case Glider.query(db, statement) do
+              {:error, reason} -> reason =~ "not run as statements here"
+              {:ok, _} -> false
+            end
+
+          # glider explains `EXPLAIN BEGIN` without running it; aerotow
+          # refuses it all the same.
+          expected = refused? or statement == "EXPLAIN BEGIN"
+
+          assert Statement.transaction?(statement) == expected,
+                 "#{inspect(statement)}: glider_ex refuses it as a transaction control: #{refused?}"
+        end
+      end)
+    end
+
+    test "check_run/1 refuses what transaction?/1 finds and takes everything else" do
+      assert {:error, message} = Statement.check_run("`commit`")
+      assert message =~ "Aerotow.checkout/4"
+      assert {:error, _} = Statement.check_run("EXPLAIN `explain` commit")
+      assert Statement.check_run("EXPLAIN MATCH (begin) RETURN begin") == :ok
+      assert Statement.check_run("CREATE (n)") == :ok
+      assert {:error, _} = Statement.check_run(:begin)
+      refute Statement.transaction?(<<"BEGIN", 0xFF>>)
+      refute Statement.transaction?(nil)
     end
   end
 
@@ -608,49 +671,65 @@ defmodule Aerotow.StatementTest do
   # --------------------------------------------------------------- limits
 
   describe "limits" do
-    test "a statement nested more than 32 levels deep is a write, and the deepest read glider runs" do
-      nested = fn n -> "MATCH (n) WHERE " <> parens(n, "true") <> " RETURN n" end
-
-      lists = fn n ->
-        "MATCH (n) RETURN " <> String.duplicate("[", n) <> "1" <> String.duplicate("]", n)
-      end
-
-      minus = fn n -> "MATCH (n) RETURN " <> String.duplicate("- ", n) <> "1" end
-      negated = fn n -> "MATCH (n) WHERE " <> String.duplicate("NOT ", n) <> "true RETURN n" end
-
-      calls = fn n ->
-        "MATCH (n) RETURN " <> String.duplicate("abs(", n) <> "1" <> String.duplicate(")", n)
-      end
-
-      for shape <- [nested, lists, minus, negated, calls] do
-        assert Statement.classify(shape.(32)) == :read
-        assert Statement.classify(shape.(33)) == :write
-        assert {:error, message} = Statement.check_read(shape.(33))
-        assert message =~ "nested more than 32 levels"
-        assert {_, {:ok, _}, _} = run(shape.(32), [])
-      end
+    test "R17: past 64 brackets, NOTs and minus signs open at once, glider refuses, and so does this module" do
+      at_the_limit([
+        {"parentheses", fn n -> "MATCH (n) WHERE " <> parens(n, "true") <> " RETURN n" end},
+        {"lists",
+         fn n ->
+           "MATCH (n) RETURN " <> String.duplicate("[", n) <> "1" <> String.duplicate("]", n)
+         end},
+        {"unary minus", fn n -> "MATCH (n) RETURN " <> String.duplicate("- ", n) <> "1" end},
+        {"NOT", fn n -> "MATCH (n) WHERE " <> String.duplicate("NOT ", n) <> "true RETURN n" end},
+        {"calls",
+         fn n ->
+           "MATCH (n) RETURN " <> String.duplicate("abs(", n) <> "1" <> String.duplicate(")", n)
+         end},
+        {"IN lists",
+         fn n ->
+           "MATCH (n) WHERE " <>
+             String.duplicate("1 IN [", n) <> "1" <> String.duplicate("]", n) <> " RETURN n"
+         end},
+        {"subscripts inside parentheses",
+         fn n -> "MATCH (n) RETURN " <> parens(n - 1, "n.name[..]") end}
+      ])
     end
 
-    test "an expression more than 128 levels deep is a write, and the deepest read glider runs" do
+    test "R17: past an expression tree 64 levels deep, glider refuses, and so does this module" do
+      at_the_limit([
+        {"subscripts", fn n -> "MATCH (n) RETURN n.name" <> String.duplicate("[0]", n) end},
+        {"slices", fn n -> "MATCH (n) RETURN n.name" <> String.duplicate("[0..1]", n) end},
+        {"comparisons in parentheses",
+         fn n -> "MATCH (n) WHERE " <> nest(n, "n.age", &"(#{&1}) = 1") <> " RETURN n" end},
+        {"AND chains in parentheses",
+         fn n -> "MATCH (n) WHERE " <> nest(n, "true", &"(#{&1}) AND true") <> " RETURN n" end}
+      ])
+    end
+
+    test "R17: a chain of AND, OR, +, - or * is one level however long, and glider runs it" do
       chain = fn op, n ->
         "MATCH (n) WHERE " <> Enum.map_join(1..n, " #{op} ", fn _ -> "n.age" end) <> " RETURN n"
       end
 
-      subscripts = fn n -> "MATCH (n) RETURN n.name" <> String.duplicate("[0]", n - 1) end
-
-      for shape <- [
-            &chain.("+", &1),
-            &chain.("AND", &1),
-            &chain.("OR", &1),
-            &chain.("-", &1),
-            subscripts
-          ] do
-        assert Statement.classify(shape.(128)) == :read
-        assert Statement.classify(shape.(129)) == :write
-        assert {:error, message} = Statement.check_read(shape.(129))
-        assert message =~ "more than 128 levels deep"
-        assert {_, {:ok, _}, _} = run(shape.(128), [])
+      for op <- ["AND", "OR", "+", "-", "*"] do
+        statement = chain.(op, 10_000)
+        assert Statement.classify(statement) == :read, op
+        assert {_, {:ok, _}, _} = run(statement, [])
       end
+
+      assert Statement.classify("CALL pagerank(top: 9 - 1 - 1 - 1 - 1 - 1)") == :read
+      assert Statement.classify("CALL pagerank(top: 9 - 1 + 1)") == :write
+    end
+
+    test "R17: 64 EXPLAINs in a row read and run, and glider refuses 65" do
+      explain = fn n -> String.duplicate("EXPLAIN ", n) <> "MATCH (n) RETURN n" end
+
+      assert Statement.classify(explain.(64)) == :read
+      assert {_, {:ok, _}, _} = run(explain.(64), [])
+
+      assert {:error, message} = Statement.check_read(explain.(65))
+      assert message =~ "glider would refuse (EXPLAIN nested deeper than 64 levels)"
+      assert {_, {:error, reason}, _} = run(explain.(65), [])
+      assert reason =~ "EXPLAIN nested deeper than 64 levels"
     end
 
     test "a statement longer than glider_ex takes is a write" do
@@ -780,6 +859,24 @@ defmodule Aerotow.StatementTest do
 
   defp parens(n, inner), do: String.duplicate("(", n) <> inner <> String.duplicate(")", n)
 
+  # Each shape at 64 is the deepest glider takes, and at 65 one it refuses:
+  # this module must say so for both, and glider must agree.
+  defp at_the_limit(shapes) do
+    for {name, shape} <- shapes do
+      assert Statement.classify(shape.(64)) == :read, "#{name} at 64"
+      assert {_, {:ok, _}, _} = run(shape.(64), []), "glider runs #{name} at 64"
+
+      assert {:error, message} = Statement.check_read(shape.(65))
+      assert message =~ "glider would refuse", "#{name} at 65: #{message}"
+      assert message =~ "nested deeper than 64 levels", "#{name} at 65: #{message}"
+      assert {_, {:error, reason}, _} = run(shape.(65), [])
+      assert reason =~ "nested deeper than 64 levels", "glider on #{name} at 65: #{reason}"
+    end
+  end
+
+  # `inner` wrapped n times by `wrap`.
+  defp nest(n, inner, wrap), do: Enum.reduce(1..n//1, inner, fn _, e -> wrap.(e) end)
+
   defp reductions(fun) do
     {:reductions, before} = Process.info(self(), :reductions)
     fun.()
@@ -808,8 +905,7 @@ defmodule Aerotow.StatementTest do
       {"Unicode whitespace",
        &("MATCH (n) RETURN n" <> String.duplicate("\u{3000}", div(&1 - 18, 3))), :read},
       {"a chain of +",
-       &("MATCH (n) WHERE " <> String.duplicate("1 + ", div(&1 - 30, 4)) <> "1 RETURN n"),
-       :write},
+       &("MATCH (n) WHERE " <> String.duplicate("1 + ", div(&1 - 30, 4)) <> "1 RETURN n"), :read},
       {"NOT",
        &("MATCH (n) WHERE " <> String.duplicate("NOT ", div(&1 - 30, 4)) <> "true RETURN n"),
        :write},
