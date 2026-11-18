@@ -1,7 +1,6 @@
 defmodule Aerotow.Statement do
   @max_bytes 1_048_576
-  @max_nesting 32
-  @max_height 128
+  @max_depth 64
 
   @moduledoc """
   Tells a statement that reads from one that writes.
@@ -18,7 +17,7 @@ defmodule Aerotow.Statement do
     * `CALL context.retrieve`, `context.search`, `context.paths`,
       `context.schema` or `context.help`
     * `STATS`, `SCHEMA`, `SHOW EXTENSIONS`, `HELP`
-    * `EXPLAIN` of one of those
+    * `EXPLAIN` of one of those, or of an `EXPLAIN` of one
 
   Everything else is a write: every other kind of statement; a `CALL` with a
   `write:` argument, whatever its value (`write: null` stores a property
@@ -47,14 +46,15 @@ defmodule Aerotow.Statement do
       minus signs and `/* */` is not a comment. Whitespace is Unicode's.
       `;` is skipped wherever it is, so `MATCH (n); RETURN n` is one
       statement.
+    * `EXPLAIN` is a word like any other: after a comment, in backticks,
+      with parameters in what it explains, and any number of them in a row
+      up to the limit below.
 
   Some spellings glider accepts but reads from somewhere unexpected. They
   are writes here:
 
     * a backtick name with no closing backtick, which glider takes to the end
       of the statement
-    * `EXPLAIN` after a comment, a `;` or a backtick: glider parses the
-      statement again from 7 bytes past its first non-blank character
     * a quoted name with a dot in it where glider looks for a procedure or a
       function: ``CALL `context.index`()`` runs `context.index`
     * an algorithm, a procedure or an argument named with characters outside
@@ -63,13 +63,15 @@ defmodule Aerotow.Statement do
 
   ## Limits
 
-  Glider parses and evaluates statements recursively, and a statement deep
-  enough overflows the native stack and takes the whole VM down: about 120
-  levels of parentheses will do it, and so will a chain of about 800
-  operators. So a statement nested more than #{@max_nesting} levels deep, or
-  with an expression more than #{@max_height} levels deep, is not taken as a
-  read. Nor is one longer than #{@max_bytes} bytes (more than glider_ex
-  accepts) or one that is not UTF-8.
+  Glider (its `value::MAX_DEPTH`) refuses an expression nested deeper than
+  #{@max_depth} levels, counted two ways: the brackets of any kind, `NOT`s
+  and unary minus signs open at once, and the depth of the tree it builds.
+  A chain of one operator (`AND`, `OR`, `+` and `-`, `*` and `/`) is one
+  level of that tree however long it is, and brackets around an expression
+  add none. Glider also refuses more than #{@max_depth} `EXPLAIN`s in a row.
+  This module counts the same way, and a statement past either limit is one
+  glider would refuse, so a write. So is a statement longer than
+  #{@max_bytes} bytes (more than glider_ex accepts) or one that is not UTF-8.
 
   Classifying is linear in the length of the statement and makes no atoms.
   """
@@ -150,12 +152,17 @@ defmodule Aerotow.Statement do
   end
 
   @doc """
-  Whether `statement` is `BEGIN`, `COMMIT` or `ROLLBACK`, as glider would
-  read it: in any case, after comments, `;` or whitespace, in backticks, or
-  after `EXPLAIN`. Sent as text, these turn autocommit off or on for the
-  whole handle, behind the backs of every other caller, so `Aerotow.run/5`
-  and `Aerotow.write_batch/4` refuse them; a transaction is
+  Whether `statement` is `BEGIN`, `COMMIT` or `ROLLBACK`, exactly as glider's
+  `query::controls_transaction` decides it: the first word, in any case,
+  after whitespace, `;` and `//` comments, in backticks or not. glider_ex
+  refuses these as text for the same reason `Aerotow.run/5` and
+  `Aerotow.write_batch/4` do: they turn autocommit off or on for the whole
+  handle, behind the backs of every other caller. A transaction is
   `Aerotow.checkout/4` with `Glider.transaction/2`.
+
+  It is also true after `EXPLAIN`s (`EXPLAIN BEGIN`), which glider explains
+  without running: nothing is lost by refusing them, and this way the
+  answer does not hang on how glider treats an explained control.
 
       iex> Aerotow.Statement.transaction?("  // open one\\n begin")
       true
@@ -164,17 +171,9 @@ defmodule Aerotow.Statement do
       false
   """
   @spec transaction?(term()) :: boolean()
-  def transaction?(statement)
-      when is_binary(statement) and byte_size(statement) <= @max_bytes do
-    with true <- String.valid?(statement),
-         {:ok, toks} <- tokens(statement, true) do
-      case Enum.drop_while(toks, &(&1 == "explain")) do
-        [word | _] -> word in ~w(begin commit rollback)
-        [] -> false
-      end
-    else
-      _ -> false
-    end
+  def transaction?(statement) when is_binary(statement) do
+    String.valid?(statement) and
+      (statement |> skip_preamble() |> control_word?() or explained_control?(statement))
   end
 
   def transaction?(_statement), do: false
@@ -235,9 +234,8 @@ defmodule Aerotow.Statement do
         {:write, "a statement that is not UTF-8"}
 
       true ->
-        case tokens(statement, true) do
+        case tokens(statement) do
           {:ok, []} -> {:write, "an empty statement"}
-          {:ok, ["explain" | _]} -> explain(statement)
           {:ok, toks} -> parse(toks)
           {:error, why} -> refused(why)
         end
@@ -251,26 +249,73 @@ defmodule Aerotow.Statement do
   defp refused({:write, what}), do: {:write, what}
   defp refused(why), do: {:write, "a statement glider would refuse (#{why})"}
 
-  # Glider's EXPLAIN does not parse the tokens after it: it parses the source
-  # again from 7 bytes past its first non-blank character. That is the
-  # statement after EXPLAIN only when EXPLAIN is spelled out right there.
-  defp explain(statement) do
-    with <<word::binary-size(7), rest::binary>> <- trim_leading(statement),
-         "explain" <- key(word) do
-      case tokens(rest, false) do
-        {:ok, []} -> {:write, "EXPLAIN of nothing"}
-        {:ok, ["explain" | _]} -> {:write, "EXPLAIN of EXPLAIN"}
-        {:ok, toks} -> toks |> parse() |> explained()
-        {:error, why} -> why |> refused() |> explained()
-      end
-    else
-      _ ->
-        {:write,
-         "EXPLAIN after a comment, a ';' or a backtick, which glider parses from the wrong place"}
+  # ------------------------------------------------------------ transactions
+
+  # What controls_transaction skips before the first word: whitespace, ';'
+  # and comments, a comment ending before its "\n".
+  defp skip_preamble(<<?;, rest::binary>>), do: skip_preamble(rest)
+
+  defp skip_preamble(<<?/, ?/, rest::binary>>) do
+    case :binary.match(rest, "\n") do
+      {at, 1} -> skip_preamble(binary_part(rest, at, byte_size(rest) - at))
+      :nomatch -> ""
     end
   end
 
-  defp explained({class, what}), do: {class, "EXPLAIN of " <> what}
+  defp skip_preamble(bin) do
+    case space_size(bin) do
+      0 -> bin
+      n -> skip_preamble(binary_part(bin, n, byte_size(bin) - n))
+    end
+  end
+
+  defp explained_control?(statement) do
+    case tokens(statement) do
+      {:ok, ["explain" | toks]} ->
+        match?(
+          [word | _] when word in ~w(begin commit rollback),
+          Enum.drop_while(toks, &(&1 == "explain"))
+        )
+
+      _ ->
+        false
+    end
+  end
+
+  # In backticks the word is what comes before the next backtick, or the
+  # rest when there is none. Otherwise it is the run of characters Rust
+  # calls alphanumeric, and '_'.
+  defp control_word?(<<?`, rest::binary>>) do
+    word =
+      case :binary.match(rest, "`") do
+        {at, 1} -> binary_part(rest, 0, at)
+        :nomatch -> rest
+      end
+
+    key(word) in ~w(begin commit rollback)
+  end
+
+  defp control_word?(bin) do
+    Enum.any?(~w(begin commit rollback), fn word ->
+      size = byte_size(word)
+
+      case bin do
+        <<head::binary-size(^size), rest::binary>> ->
+          key(head) == word and not word_goes_on?(rest)
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  defp word_goes_on?(<<c, _::binary>>) when c < 0x80,
+    do: c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
+
+  defp word_goes_on?(<<c::utf8, _::binary>>),
+    do: Regex.match?(~r/\A[\p{Alphabetic}\p{N}]\z/u, <<c::utf8>>)
+
+  defp word_goes_on?(_rest), do: false
 
   # ------------------------------------------------------------------ tokens
 
@@ -282,16 +327,15 @@ defmodule Aerotow.Statement do
   #   :str, :int, :float   a literal; what is in it never decides anything
   #   :param               a $parameter, which glider replaces by its value
   #
-  # `params?` is false for the statement inside EXPLAIN, which glider parses
-  # without parameters. A name with characters outside ASCII is checked
-  # afterwards against the classes glider uses (Rust's is_alphabetic and
-  # is_alphanumeric), once for the whole statement.
+  # A name with characters outside ASCII is checked afterwards against the
+  # classes glider uses (Rust's is_alphabetic and is_alphanumeric), once for
+  # the whole statement.
   #
   # The lexer walks the statement once, passing the rest along in tail calls;
   # `pos` is where the rest starts in `src`, for cutting a name or a number
   # out of it.
-  defp tokens(text, params?) do
-    with {:ok, toks, wide} <- lex(text, text, 0, [], :none, [], params?),
+  defp tokens(text) do
+    with {:ok, toks, wide} <- lex(text, text, 0, [], :none, []),
          :ok <- check_wide(wide),
          do: {:ok, toks}
   end
@@ -303,71 +347,68 @@ defmodule Aerotow.Statement do
 
   # `last` is what the previous token was (:none, :sym or :value): glider
   # reads `-1` as a negative number only at the start or after a symbol.
-  defp lex(<<>>, _src, _pos, acc, _last, wide, _params?), do: {:ok, Enum.reverse(acc), wide}
+  defp lex(<<>>, _src, _pos, acc, _last, wide), do: {:ok, Enum.reverse(acc), wide}
 
   # White_Space, which is what Rust's char::is_whitespace, and so glider, skips.
-  defp lex(<<c, rest::binary>>, src, pos, acc, last, wide, params?) when space(c),
-    do: lex(rest, src, pos + 1, acc, last, wide, params?)
+  defp lex(<<c, rest::binary>>, src, pos, acc, last, wide) when space(c),
+    do: lex(rest, src, pos + 1, acc, last, wide)
 
-  defp lex(<<0xC2, c, rest::binary>>, src, pos, acc, last, wide, params?)
+  defp lex(<<0xC2, c, rest::binary>>, src, pos, acc, last, wide)
        when c == 0x85 or c == 0xA0,
-       do: lex(rest, src, pos + 2, acc, last, wide, params?)
+       do: lex(rest, src, pos + 2, acc, last, wide)
 
-  defp lex(<<0xE1, 0x9A, 0x80, rest::binary>>, src, pos, acc, last, wide, params?),
-    do: lex(rest, src, pos + 3, acc, last, wide, params?)
+  defp lex(<<0xE1, 0x9A, 0x80, rest::binary>>, src, pos, acc, last, wide),
+    do: lex(rest, src, pos + 3, acc, last, wide)
 
-  defp lex(<<0xE2, 0x80, c, rest::binary>>, src, pos, acc, last, wide, params?)
+  defp lex(<<0xE2, 0x80, c, rest::binary>>, src, pos, acc, last, wide)
        when c in 0x80..0x8A or c in [0xA8, 0xA9, 0xAF],
-       do: lex(rest, src, pos + 3, acc, last, wide, params?)
+       do: lex(rest, src, pos + 3, acc, last, wide)
 
-  defp lex(<<0xE2, 0x81, 0x9F, rest::binary>>, src, pos, acc, last, wide, params?),
-    do: lex(rest, src, pos + 3, acc, last, wide, params?)
+  defp lex(<<0xE2, 0x81, 0x9F, rest::binary>>, src, pos, acc, last, wide),
+    do: lex(rest, src, pos + 3, acc, last, wide)
 
-  defp lex(<<0xE3, 0x80, 0x80, rest::binary>>, src, pos, acc, last, wide, params?),
-    do: lex(rest, src, pos + 3, acc, last, wide, params?)
+  defp lex(<<0xE3, 0x80, 0x80, rest::binary>>, src, pos, acc, last, wide),
+    do: lex(rest, src, pos + 3, acc, last, wide)
 
   # A comment runs to "\n" and no further.
-  defp lex(<<?/, ?/, rest::binary>>, src, pos, acc, last, wide, params?) do
+  defp lex(<<?/, ?/, rest::binary>>, src, pos, acc, last, wide) do
     case :binary.match(rest, "\n") do
       {at, 1} ->
         rest = binary_part(rest, at, byte_size(rest) - at)
-        lex(rest, src, pos + 2 + at, acc, last, wide, params?)
+        lex(rest, src, pos + 2 + at, acc, last, wide)
 
       :nomatch ->
-        lex(<<>>, src, byte_size(src), acc, last, wide, params?)
+        lex(<<>>, src, byte_size(src), acc, last, wide)
     end
   end
 
   # A name starts with a letter or '_'. Any character outside ASCII that is
   # not whitespace is taken into one here and checked in check_wide/1.
-  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide, params?) when name_start(c),
-    do: word(rest, src, pos, pos + 1, :name, acc, wide, params?)
+  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide) when name_start(c),
+    do: word(rest, src, pos, pos + 1, :name, acc, wide)
 
-  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide, params?) when c >= 0x80,
-    do: word(rest, src, pos, pos + 1, :wide_name, acc, wide, params?)
+  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide) when c >= 0x80,
+    do: word(rest, src, pos, pos + 1, :wide_name, acc, wide)
 
-  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide, params?) when digit(c),
-    do: number(rest, src, pos, pos + 1, acc, wide, params?)
+  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide) when digit(c),
+    do: number(rest, src, pos, pos + 1, acc, wide)
 
-  defp lex(<<?-, c, rest::binary>>, src, pos, acc, last, wide, params?)
+  defp lex(<<?-, c, rest::binary>>, src, pos, acc, last, wide)
        when digit(c) and last != :value,
-       do: number(rest, src, pos, pos + 2, acc, wide, params?)
+       do: number(rest, src, pos, pos + 2, acc, wide)
 
-  defp lex(<<q, rest::binary>>, src, pos, acc, _last, wide, params?) when q == ?" or q == ?',
-    do: string(rest, src, pos + 1, q, acc, wide, params?)
+  defp lex(<<q, rest::binary>>, src, pos, acc, _last, wide) when q == ?" or q == ?',
+    do: string(rest, src, pos + 1, q, acc, wide)
 
-  defp lex(<<?$, rest::binary>>, src, pos, acc, _last, wide, true),
-    do: word(rest, src, pos + 1, pos + 1, :param, acc, wide, true)
-
-  defp lex(<<?$, _::binary>>, _src, _pos, _acc, _last, _wide, false),
-    do: {:error, "a parameter after EXPLAIN, which glider parses without parameters"}
+  defp lex(<<?$, rest::binary>>, src, pos, acc, _last, wide),
+    do: word(rest, src, pos + 1, pos + 1, :param, acc, wide)
 
   # A name in backticks may hold anything but a backtick.
-  defp lex(<<?`, rest::binary>>, src, pos, acc, _last, wide, params?) do
+  defp lex(<<?`, rest::binary>>, src, pos, acc, _last, wide) do
     case :binary.match(rest, "`") do
       {at, 1} ->
         <<text::binary-size(^at), ?`, rest::binary>> = rest
-        lex(rest, src, pos + at + 2, [key(text) | acc], :value, wide, params?)
+        lex(rest, src, pos + at + 2, [key(text) | acc], :value, wide)
 
       :nomatch ->
         {:error,
@@ -375,35 +416,35 @@ defmodule Aerotow.Statement do
     end
   end
 
-  defp lex(<<?;, rest::binary>>, src, pos, acc, last, wide, params?),
-    do: lex(rest, src, pos + 1, acc, last, wide, params?)
+  defp lex(<<?;, rest::binary>>, src, pos, acc, last, wide),
+    do: lex(rest, src, pos + 1, acc, last, wide)
 
-  defp lex(<<?-, ?>, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:-> | acc], :sym, wide, params?)
+  defp lex(<<?-, ?>, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:-> | acc], :sym, wide)
 
-  defp lex(<<?<, ?-, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:<- | acc], :sym, wide, params?)
+  defp lex(<<?<, ?-, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:<- | acc], :sym, wide)
 
-  defp lex(<<?<, ?>, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:<> | acc], :sym, wide, params?)
+  defp lex(<<?<, ?>, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:<> | acc], :sym, wide)
 
-  defp lex(<<?<, ?=, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:<= | acc], :sym, wide, params?)
+  defp lex(<<?<, ?=, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:<= | acc], :sym, wide)
 
-  defp lex(<<?>, ?=, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:>= | acc], :sym, wide, params?)
+  defp lex(<<?>, ?=, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:>= | acc], :sym, wide)
 
-  defp lex(<<?!, ?=, rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:!= | acc], :sym, wide, params?)
+  defp lex(<<?!, ?=, rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:!= | acc], :sym, wide)
 
-  defp lex(<<?., ?., rest::binary>>, src, pos, acc, _last, wide, params?),
-    do: lex(rest, src, pos + 2, [:.. | acc], :sym, wide, params?)
+  defp lex(<<?., ?., rest::binary>>, src, pos, acc, _last, wide),
+    do: lex(rest, src, pos + 2, [:.. | acc], :sym, wide)
 
-  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide, params?)
+  defp lex(<<c, rest::binary>>, src, pos, acc, _last, wide)
        when c in ~c"(){}[]:,.=<>*-+/|!",
-       do: lex(rest, src, pos + 1, [symbol(c) | acc], :sym, wide, params?)
+       do: lex(rest, src, pos + 1, [symbol(c) | acc], :sym, wide)
 
-  defp lex(<<c::utf8, _::binary>>, _src, _pos, _acc, _last, _wide, _params?),
+  defp lex(<<c::utf8, _::binary>>, _src, _pos, _acc, _last, _wide),
     do: {:error, "unexpected character #{inspect(<<c::utf8>>)}"}
 
   defp symbol(?(), do: :"("
@@ -428,73 +469,73 @@ defmodule Aerotow.Statement do
   # The rest of a name or of a parameter's name. A character outside ASCII
   # continues it unless it is whitespace; byte by byte is enough, since no
   # continuation byte starts a whitespace character.
-  defp word(<<c, rest::binary>>, src, start, pos, kind, acc, wide, params?) when name_char(c),
-    do: word(rest, src, start, pos + 1, kind, acc, wide, params?)
+  defp word(<<c, rest::binary>>, src, start, pos, kind, acc, wide) when name_char(c),
+    do: word(rest, src, start, pos + 1, kind, acc, wide)
 
-  defp word(<<c, _::binary>> = bin, src, start, pos, kind, acc, wide, params?) when c >= 0x80 do
+  defp word(<<c, _::binary>> = bin, src, start, pos, kind, acc, wide) when c >= 0x80 do
     case space_size(bin) do
       0 ->
         <<_, rest::binary>> = bin
-        word(rest, src, start, pos + 1, widen(kind), acc, wide, params?)
+        word(rest, src, start, pos + 1, widen(kind), acc, wide)
 
       _ ->
-        word_end(bin, src, start, pos, kind, acc, wide, params?)
+        word_end(bin, src, start, pos, kind, acc, wide)
     end
   end
 
-  defp word(rest, src, start, pos, kind, acc, wide, params?),
-    do: word_end(rest, src, start, pos, kind, acc, wide, params?)
+  defp word(rest, src, start, pos, kind, acc, wide),
+    do: word_end(rest, src, start, pos, kind, acc, wide)
 
   # :wide_name and :wide_param have characters outside ASCII, for check_wide/1.
   defp widen(:name), do: :wide_name
   defp widen(:param), do: :wide_param
   defp widen(wide_kind), do: wide_kind
 
-  defp word_end(rest, src, start, pos, kind, acc, wide, params?)
+  defp word_end(rest, src, start, pos, kind, acc, wide)
        when kind in [:name, :wide_name] do
     name = key(binary_part(src, start, pos - start))
     wide = if kind == :wide_name, do: [{:name, name} | wide], else: wide
-    lex(rest, src, pos, [name | acc], :value, wide, params?)
+    lex(rest, src, pos, [name | acc], :value, wide)
   end
 
-  defp word_end(_rest, _src, start, start, :param, _acc, _wide, _params?),
+  defp word_end(_rest, _src, start, start, :param, _acc, _wide),
     do: {:error, "expected a parameter name after $"}
 
-  defp word_end(rest, src, start, pos, kind, acc, wide, params?) do
+  defp word_end(rest, src, start, pos, kind, acc, wide) do
     wide =
       if kind == :wide_param,
         do: [{:param, binary_part(src, start, pos - start)} | wide],
         else: wide
 
-    lex(rest, src, pos, [:param | acc], :value, wide, params?)
+    lex(rest, src, pos, [:param | acc], :value, wide)
   end
 
   # A backslash takes the character after it, whatever it is.
-  defp string(<<?\\, _, rest::binary>>, src, pos, q, acc, wide, params?),
-    do: string(rest, src, pos + 2, q, acc, wide, params?)
+  defp string(<<?\\, _, rest::binary>>, src, pos, q, acc, wide),
+    do: string(rest, src, pos + 2, q, acc, wide)
 
-  defp string(<<q, rest::binary>>, src, pos, q, acc, wide, params?),
-    do: lex(rest, src, pos + 1, [:str | acc], :value, wide, params?)
+  defp string(<<q, rest::binary>>, src, pos, q, acc, wide),
+    do: lex(rest, src, pos + 1, [:str | acc], :value, wide)
 
-  defp string(<<_, rest::binary>>, src, pos, q, acc, wide, params?),
-    do: string(rest, src, pos + 1, q, acc, wide, params?)
+  defp string(<<_, rest::binary>>, src, pos, q, acc, wide),
+    do: string(rest, src, pos + 1, q, acc, wide)
 
-  defp string(<<>>, _src, _pos, _q, _acc, _wide, _params?), do: {:error, "unterminated string"}
+  defp string(<<>>, _src, _pos, _q, _acc, _wide), do: {:error, "unterminated string"}
 
   # Glider takes digits, '.', 'e' and 'E' after an optional '-', stopping
   # before "..", and parses that as an i64 or failing that an f64.
-  defp number(<<?., ?., rest::binary>>, src, start, pos, acc, wide, params?) do
+  defp number(<<?., ?., rest::binary>>, src, start, pos, acc, wide) do
     with {:ok, kind} <- number_kind(binary_part(src, start, pos - start)),
-         do: lex(rest, src, pos + 2, [:.., kind | acc], :sym, wide, params?)
+         do: lex(rest, src, pos + 2, [:.., kind | acc], :sym, wide)
   end
 
-  defp number(<<c, rest::binary>>, src, start, pos, acc, wide, params?)
+  defp number(<<c, rest::binary>>, src, start, pos, acc, wide)
        when digit(c) or c in [?., ?e, ?E],
-       do: number(rest, src, start, pos + 1, acc, wide, params?)
+       do: number(rest, src, start, pos + 1, acc, wide)
 
-  defp number(rest, src, start, pos, acc, wide, params?) do
+  defp number(rest, src, start, pos, acc, wide) do
     with {:ok, kind} <- number_kind(binary_part(src, start, pos - start)),
-         do: lex(rest, src, pos, [kind | acc], :value, wide, params?)
+         do: lex(rest, src, pos, [kind | acc], :value, wide)
   end
 
   defp number_kind(text) do
@@ -548,13 +589,6 @@ defmodule Aerotow.Statement do
   defp space_size(<<0xE2, 0x81, 0x9F, _::binary>>), do: 3
   defp space_size(<<0xE3, 0x80, 0x80, _::binary>>), do: 3
   defp space_size(_bin), do: 0
-
-  defp trim_leading(bin) do
-    case space_size(bin) do
-      0 -> bin
-      n -> trim_leading(binary_part(bin, n, byte_size(bin) - n))
-    end
-  end
 
   # Glider takes a character outside ASCII into a name only when Rust calls
   # it alphabetic, or numeric after a name's first character (a parameter's
@@ -641,6 +675,11 @@ defmodule Aerotow.Statement do
     end
   end
 
+  # Glider counts the EXPLAINs in a row, refusing more than @max_depth, and
+  # parses the statement after them once. Explaining runs nothing, but an
+  # EXPLAIN reads only when what it explains does.
+  defp stmt(["explain" | _] = toks), do: explain(toks, 0)
+
   defp stmt(["match" | toks]) do
     with {:ok, rest} <- patterns(toks),
          {:ok, rest} <- where(rest),
@@ -675,6 +714,16 @@ defmodule Aerotow.Statement do
     do: {:ok, {:write, String.upcase(word)}, rest}
 
   defp stmt(_toks), do: {:error, "not a statement glider knows"}
+
+  defp explain(["explain" | _], count) when count >= @max_depth,
+    do: {:error, "EXPLAIN nested deeper than #{@max_depth} levels"}
+
+  defp explain(["explain" | toks], count), do: explain(toks, count + 1)
+
+  defp explain(toks, _count) do
+    with {:ok, {class, what}, rest} <- stmt(toks),
+         do: {:ok, {class, "EXPLAIN of " <> what}, rest}
+  end
 
   defp read(rest, what), do: {:ok, {:read, what}, rest}
 
@@ -990,14 +1039,18 @@ defmodule Aerotow.Statement do
   # multiplicative < subscripts < primary. Each step returns {kind, height}:
   # kind is what glider's const_value makes of the expression (:num, :const,
   # :param, or :expr for one that is not a constant), and height is the
-  # depth of the tree glider builds, which it evaluates and frees
-  # recursively. `depth` counts the levels the parser has recursed into.
+  # depth of the tree glider builds, counted as glider counts it: a leaf is
+  # 0, brackets around an expression add nothing, and a chain of one
+  # operator is one level over its deepest operand however long it is.
+  # `depth` is glider's other count: the brackets, NOTs and unary minus
+  # signs open around the tokens being read. Glider refuses either past
+  # @max_depth.
 
   defp value(toks) do
     with {:ok, _, rest} <- expr(toks, 0), do: {:ok, rest}
   end
 
-  defp expr(_toks, depth) when depth > @max_nesting, do: too_deep()
+  defp expr(_toks, depth) when depth > @max_depth, do: too_deep()
 
   # An operand, or a name and a property, followed by nothing that can go on
   # with an expression is the whole expression: glider's descent through the
@@ -1007,7 +1060,7 @@ defmodule Aerotow.Statement do
        when is_binary(name) and is_binary(key) and name not in ["not", "true", "false", "null"] do
     case rest do
       [next | _] when next in @goes_on -> descend(toks, depth)
-      rest -> {:ok, {:expr, 1}, rest}
+      rest -> {:ok, {:expr, 0}, rest}
     end
   end
 
@@ -1021,54 +1074,52 @@ defmodule Aerotow.Statement do
 
   defp expr([], depth), do: descend([], depth)
 
-  defp operand(literal) when literal in [:int, :float], do: {:num, 1}
-  defp operand(:str), do: {:const, 1}
-  defp operand(:param), do: {:param, 1}
-  defp operand(word) when word in ["true", "false"], do: {:num, 1}
-  defp operand("null"), do: {:const, 1}
+  defp operand(literal) when literal in [:int, :float], do: {:num, 0}
+  defp operand(:str), do: {:const, 0}
+  defp operand(:param), do: {:param, 0}
+  defp operand(word) when word in ["true", "false"], do: {:num, 0}
+  defp operand("null"), do: {:const, 0}
   defp operand("not"), do: nil
-  defp operand(name) when is_binary(name), do: {:expr, 1}
+  defp operand(name) when is_binary(name), do: {:expr, 0}
   defp operand(_sym), do: nil
 
+  # The height only grows towards the root, so a tree is too deep exactly
+  # when its root is.
   defp descend(toks, depth) do
     case or_expr(toks, depth) do
-      {:ok, {_, height}, _} when height > @max_height ->
-        {:error, {:write, "a statement with an expression more than #{@max_height} levels deep"}}
-
-      result ->
-        result
+      {:ok, {_, height}, _} when height > @max_depth -> too_deep()
+      result -> result
     end
   end
 
-  defp too_deep,
-    do: {:error, {:write, "a statement nested more than #{@max_nesting} levels deep"}}
+  defp too_deep, do: {:error, "expression nested deeper than #{@max_depth} levels"}
 
   defp or_expr(toks, depth) do
-    with {:ok, left, rest} <- and_expr(toks, depth), do: or_more(rest, left, depth)
+    with {:ok, first, rest} <- and_expr(toks, depth), do: or_more(rest, {:one, first}, depth)
   end
 
-  defp or_more(["or" | toks], left, depth) do
-    with {:ok, right, rest} <- and_expr(toks, depth),
-         do: or_more(rest, join(left, right), depth)
+  defp or_more(["or" | toks], chain, depth) do
+    with {:ok, next, rest} <- and_expr(toks, depth),
+         do: or_more(rest, link(chain, :or, next), depth)
   end
 
-  defp or_more(toks, left, _depth), do: {:ok, left, toks}
+  defp or_more(toks, chain, _depth), do: {:ok, chained(chain), toks}
 
   defp and_expr(toks, depth) do
-    with {:ok, left, rest} <- not_expr(toks, depth), do: and_more(rest, left, depth)
+    with {:ok, first, rest} <- not_expr(toks, depth), do: and_more(rest, {:one, first}, depth)
   end
 
-  defp and_more(["and" | toks], left, depth) do
-    with {:ok, right, rest} <- not_expr(toks, depth),
-         do: and_more(rest, join(left, right), depth)
+  defp and_more(["and" | toks], chain, depth) do
+    with {:ok, next, rest} <- not_expr(toks, depth),
+         do: and_more(rest, link(chain, :and, next), depth)
   end
 
-  defp and_more(toks, left, _depth), do: {:ok, left, toks}
+  defp and_more(toks, chain, _depth), do: {:ok, chained(chain), toks}
 
   defp not_expr([word | toks], depth) when word in ["not", :!], do: negated(toks, depth)
   defp not_expr(toks, depth), do: comparison(toks, depth)
 
-  defp negated(_toks, depth) when depth >= @max_nesting, do: too_deep()
+  defp negated(_toks, depth) when depth >= @max_depth, do: too_deep()
 
   defp negated(toks, depth) do
     with {:ok, inner, rest} <- not_expr(toks, depth + 1), do: {:ok, wrap(inner), rest}
@@ -1089,8 +1140,10 @@ defmodule Aerotow.Statement do
          do: {:ok, join(left, items), rest}
   end
 
-  # A list parameter is what glider puts after IN in place of `[...]`.
-  defp compare(["in", :param | rest], left, _depth), do: {:ok, join(left, {:const, 2}), rest}
+  # A list parameter is what glider puts after IN in place of `[...]`. Its
+  # items are at least leaves, and it opens a bracket only when it has any,
+  # so what is counted here is the least glider counts.
+  defp compare(["in", :param | rest], left, _depth), do: {:ok, wrap(left), rest}
   defp compare(["in" | _], _left, _depth), do: {:error, "expected '['"}
   defp compare(["contains" | toks], left, depth), do: right_side(toks, left, depth)
 
@@ -1110,37 +1163,36 @@ defmodule Aerotow.Statement do
   end
 
   defp additive(toks, depth) do
-    with {:ok, left, rest} <- multiplicative(toks, depth), do: add_more(rest, left, depth)
+    with {:ok, first, rest} <- multiplicative(toks, depth),
+         do: add_more(rest, {:one, first}, depth)
   end
 
-  defp add_more([:+ | toks], left, depth) do
-    with {:ok, right, rest} <- multiplicative(toks, depth),
-         do: add_more(rest, join(left, right), depth)
+  defp add_more([op | toks], chain, depth) when op in [:+, :-] do
+    with {:ok, next, rest} <- multiplicative(toks, depth),
+         do: add_more(rest, link(chain, op, next), depth)
   end
 
-  defp add_more([:- | toks], left, depth) do
-    with {:ok, right, rest} <- multiplicative(toks, depth),
-         do: add_more(rest, minus(left, right), depth)
-  end
-
-  defp add_more(toks, left, _depth), do: {:ok, left, toks}
+  defp add_more(toks, chain, _depth), do: {:ok, chained(chain), toks}
 
   defp multiplicative(toks, depth) do
-    with {:ok, left, rest} <- atom_expr(toks, depth), do: mul_more(rest, left, depth)
+    with {:ok, first, rest} <- atom_expr(toks, depth), do: mul_more(rest, {:one, first}, depth)
   end
 
-  defp mul_more([op | toks], left, depth) when op in [:*, :/] do
-    with {:ok, right, rest} <- atom_expr(toks, depth),
-         do: mul_more(rest, join(left, right), depth)
+  defp mul_more([op | toks], chain, depth) when op in [:*, :/] do
+    with {:ok, next, rest} <- atom_expr(toks, depth),
+         do: mul_more(rest, link(chain, op, next), depth)
   end
 
-  defp mul_more(toks, left, _depth), do: {:ok, left, toks}
+  defp mul_more(toks, chain, _depth), do: {:ok, chained(chain), toks}
 
   defp atom_expr(toks, depth) do
     with {:ok, e, rest} <- primary(toks, depth), do: subscripts(rest, e, depth)
   end
 
-  # `x[i]`, `x[a..b]`, `x[..b]`, `x[a..]`, `x[..]`, any number of them.
+  # `x[i]`, `x[a..b]`, `x[..b]`, `x[a..]`, `x[..]`, any number of them. Each
+  # is one level over the deepest of its parts, and its '[' is open while
+  # they are read: even `[..]`, which glider counts before it looks inside.
+  defp subscripts([:"[" | _], _e, depth) when depth >= @max_depth, do: too_deep()
   defp subscripts([:"[", :.., :"]" | rest], e, depth), do: subscripts(rest, wrap(e), depth)
 
   defp subscripts([:"[", :.. | toks], e, depth) do
@@ -1158,7 +1210,7 @@ defmodule Aerotow.Statement do
         [:.. | rest] ->
           with {:ok, last, rest} <- expr(rest, depth + 1),
                {:ok, rest} <- expect(rest, :"]"),
-               do: subscripts(rest, join(join(e, first), last), depth)
+               do: subscripts(rest, join(e, deepest(first, last)), depth)
 
         rest ->
           with {:ok, rest} <- expect(rest, :"]"),
@@ -1170,10 +1222,10 @@ defmodule Aerotow.Statement do
   defp subscripts(toks, e, _depth), do: {:ok, e, toks}
 
   defp primary([literal | rest], _depth) when literal in [:int, :float],
-    do: {:ok, {:num, 1}, rest}
+    do: {:ok, {:num, 0}, rest}
 
-  defp primary([:str | rest], _depth), do: {:ok, {:const, 1}, rest}
-  defp primary([:param | rest], _depth), do: {:ok, {:param, 1}, rest}
+  defp primary([:str | rest], _depth), do: {:ok, {:const, 0}, rest}
+  defp primary([:param | rest], _depth), do: {:ok, {:param, 0}, rest}
 
   defp primary([:"(" | toks], depth) do
     with {:ok, e, rest} <- expr(toks, depth + 1),
@@ -1189,16 +1241,17 @@ defmodule Aerotow.Statement do
          do: {:ok, {kind, height + 1}, rest}
   end
 
-  # `-x` is glider's `0 - x`.
-  defp primary([:- | _], depth) when depth >= @max_nesting, do: too_deep()
+  # `-x` is glider's `0 - x`, a constant when x is a number.
+  defp primary([:- | _], depth) when depth >= @max_depth, do: too_deep()
 
   defp primary([:- | toks], depth) do
-    with {:ok, e, rest} <- atom_expr(toks, depth + 1), do: {:ok, minus({:num, 1}, e), rest}
+    with {:ok, e, rest} <- atom_expr(toks, depth + 1),
+         do: {:ok, chained(link({:one, {:num, 0}}, :-, e)), rest}
   end
 
   # true, false and null are literals before anything else, even before '('.
-  defp primary([word | rest], _depth) when word in ["true", "false"], do: {:ok, {:num, 1}, rest}
-  defp primary(["null" | rest], _depth), do: {:ok, {:const, 1}, rest}
+  defp primary([word | rest], _depth) when word in ["true", "false"], do: {:ok, {:num, 0}, rest}
+  defp primary(["null" | rest], _depth), do: {:ok, {:const, 0}, rest}
 
   defp primary([name, :"(" | toks], depth) when is_binary(name) do
     if String.contains?(name, ".") do
@@ -1219,18 +1272,18 @@ defmodule Aerotow.Statement do
        {:write, "a call of a function aerotow does not know (#{shown(ns <> "." <> function)})"}}
 
   defp primary([name, :., key | rest], _depth) when is_binary(name) and is_binary(key),
-    do: {:ok, {:expr, 1}, rest}
+    do: {:ok, {:expr, 0}, rest}
 
   defp primary([name, :. | _], _depth) when is_binary(name),
     do: {:error, "expected an identifier"}
 
-  defp primary([name | rest], _depth) when is_binary(name), do: {:ok, {:expr, 1}, rest}
+  defp primary([name | rest], _depth) when is_binary(name), do: {:ok, {:expr, 0}, rest}
   defp primary([tok | _], _depth), do: {:error, "unexpected #{shown_token(tok)}"}
   defp primary([], _depth), do: {:error, "unexpected end of the statement"}
 
   # `f(*)` only for a plain function name; glider has no `*` for an
-  # extension's functions.
-  defp function_args([:*, :")" | rest], _depth, true), do: {:ok, {:expr, 2}, rest}
+  # extension's functions. A call with no arguments opens no bracket.
+  defp function_args([:*, :")" | rest], _depth, true), do: {:ok, {:expr, 1}, rest}
   defp function_args([:")" | rest], _depth, _star?), do: {:ok, {:expr, 1}, rest}
 
   defp function_args(toks, depth, _star?) do
@@ -1240,7 +1293,7 @@ defmodule Aerotow.Statement do
   end
 
   # One or more expressions separated by commas: a list's kind is :const
-  # when every item is a constant.
+  # when every item is a constant, and its height is its deepest item's.
   defp items(toks, depth), do: items(toks, depth, :const, 0)
 
   defp items(toks, depth, kind, height) do
@@ -1255,14 +1308,25 @@ defmodule Aerotow.Statement do
     end
   end
 
-  defp join({_, left}, {_, right}), do: {:expr, 1 + max(left, right)}
-  defp wrap({_, height}), do: {:expr, height + 1}
+  # A chain of one operator: {:one, e} until a second operand comes, then
+  # {:many, kind, deepest}. Glider builds it as one node over all of its
+  # operands, which const_value takes as a constant only when every
+  # operator is '-' and every operand a number (booleans count).
+  defp link({:one, {kind, height}}, op, next), do: link({:many, kind, height}, op, next)
 
-  # const_value takes `a - b` of two numbers (booleans count) as a constant.
-  defp minus({left_kind, left}, {right_kind, right}) do
-    numbers? = left_kind in [:num, :param] and right_kind in [:num, :param]
-    {if(numbers?, do: :num, else: :expr), 1 + max(left, right)}
+  defp link({:many, kind, height}, op, {next_kind, next_height}) do
+    numbers? = op == :- and numeric?(kind) and numeric?(next_kind)
+    {:many, if(numbers?, do: :num, else: :expr), max(height, next_height)}
   end
+
+  defp chained({:one, e}), do: e
+  defp chained({:many, kind, height}), do: {kind, height + 1}
+
+  defp numeric?(kind), do: kind in [:num, :param]
+
+  defp join({_, left}, {_, right}), do: {:expr, 1 + max(left, right)}
+  defp deepest({_, left}, {_, right}), do: {:expr, max(left, right)}
+  defp wrap({_, height}), do: {:expr, height + 1}
 
   # -------------------------------------------------------------------- words
 
