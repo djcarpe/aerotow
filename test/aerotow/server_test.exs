@@ -63,7 +63,13 @@ defmodule Aerotow.ServerTest do
       tmp_dir: dir
     } do
       tow =
-        tow(dir, stores: [{"store", Path.join(dir, "store")}], default_store: "store", budget: 1)
+        tow(dir,
+          stores: [{"store", Path.join(dir, "store")}],
+          default_store: "store",
+          budget: 1,
+          # Working copies on disk: an empty graph in memory takes no bytes.
+          mode: "disk"
+        )
 
       listen([[:aerotow, :evict]])
 

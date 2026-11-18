@@ -281,8 +281,9 @@ listed under "Later".
 ```
 
 - **launching**: take the flight (R9), restore the newest shipped state into
-  `<dir>/flights/<store>/<ref>.gldb` (or create an empty database for a new
-  glider), open it. Callers wait.
+  `<dir>/flights/<store>/<ref>.gldb`, or into memory (or create an empty
+  database for a new glider), open it. Callers wait. Where it goes is
+  decided here ("Where the pages live").
 - **aloft**: statements run. The handle is lent to the calling process for
   each statement (a checkout), so a long query runs in its caller and never
   delays a lease renewal. Writes mark the flight dirty; a dirty flight ships
@@ -294,7 +295,8 @@ listed under "Later".
   ship fails and the lease still holds, the flight stays aloft and tries
   again.
 - **lost**: refuse everything, close. A working copy with log that never
-  shipped is moved to `<dir>/orphans/`, not deleted (R14).
+  shipped is moved to `<dir>/orphans/`, not deleted (R14); a memory flight
+  writes a replica there before it closes.
 
 A `file` store has no flights: launching opens the file where it is, and
 glider's own lock file is the guard. Landing closes it.
@@ -322,7 +324,8 @@ either.
 
 ### How many are aloft
 
-`max_aloft` (64) and `budget` (bytes of working copies; unlimited by default)
+`max_aloft` (64) and `budget` (bytes of working copies and of memory flights;
+unlimited by default)
 bound what is open here. Past either, the least recently used flights that
 nobody has checked out are landed. `idle` (5 minutes) lands a flight nobody
 has used. `pin: true` keeps one up.
@@ -471,35 +474,67 @@ Three ways for an aloft glider to hold its pages:
 
 | mode | pages | log | what RAM holds |
 |---|---|---|---|
-| `memory` | in RAM | in RAM until shipped | the whole graph |
+| `memory` | in RAM | in RAM until shipped | the whole graph, at most `max_memory` |
 | `disk` | a working file | on disk until shipped | a shared page cache, best effort |
 | `disk` with `hot:` | a working file | on disk until shipped | the cache, plus a protected hot set that survives pressure and is warm at launch |
 
 The replica in the store is the same in every case: a base and the log after
-it. A glider flown in memory today can be flown from disk tomorrow.
+it. A glider flown in memory on one flight is flown from disk on the next if
+its card says so then, and back; each launch restores the same replica into
+whichever place it flies from, on the same lineage.
 
-`mode: :auto` (the default once the engine has both) flies a glider in memory
-when its card says it is smaller than `memory_threshold` (64 MiB), and from
-disk with a hot set otherwise. `mode:` and `hot:` on a card are a glider's
-own preference; the options on the store or the instance override them.
+**Who decides.** Where the pages live is decided once per flight, as it
+launches (`Aerotow.Flight.Copy.decide/4`), and holds until it lands: a
+change made with `update/3` takes effect at the next launch. `mode` is the
+first of these that is set: the instance's `mode:`, the store's `mode:`
+option, the card's `mode` (`"auto"` unless somebody changed it). `hot` is
+chosen the same way from the instance's `hot:`, the store's `hot:` and the
+card's `hot`; `0` at any of them is "no hot set" and stops the search there.
 
-What glider has today, and what it needs:
+- **`auto`** flies a glider in memory when its card says it is smaller than
+  `memory_threshold` (64 MiB), and from disk otherwise. A new glider (no
+  size yet) starts in memory. A glider `auto` put in memory whose replica
+  turns out not to fit in `max_memory` is flown from disk instead.
+- **A `file` store's glider** is always flown from disk: its file is
+  opened where it lies. An adopted file's first flight, and a working copy
+  carried from disk (R15), are flown from disk too; the next launch decides
+  afresh.
+- **`hot`** applies to flights from disk only. It is a hot set of that many
+  bytes, at most half of the page cache (`cache_size:` on the instance, the
+  most page cache one glider from disk may use; glider's default is the
+  process's whole budget).
 
-- **Disk works today**, and v1 is built on it: `Glider.Replication.restore/3`
-  into the working directory, `Glider.open/2`, `Glider.Replication.sync/3`.
-- **Memory needs engine work.** An in-memory glider keeps no log, so it can
-  neither be shipped nor restored into. The engine change: a log kept in
-  memory, a base written from the pages in memory, and a restore that reads a
-  base and its log straight into memory, continuing the same lineage.
-- **A hot set needs engine work.** The page cache already keeps recently used
-  pages, but pressure from another database clears an idle database's whole
-  cache, and every open starts cold. The engine change: pages used often are
-  marked hot, kept out of eviction, written down at each checkpoint and read
-  back at open, and travel with the base.
+**Memory.** A memory flight is `Glider.open(max_memory: …, log: true)` when
+it is created, and `Glider.Replication.restore(url, :memory, …)` from the
+newest shipped state when it launches; it ships with
+`Glider.Replication.sync(db, url, …)`, from the handle, with no spool and no
+`db:` polling. Nothing of it is under `<dir>/flights/`. `max_memory` (an
+instance option, 512 MiB by default) bounds each one: a replica that does not
+fit is `{:error, {:launch, reason}}` with glider's reason ("… max_memory is
+…"), the flight record it took is landed with nothing shipped, and nothing is
+left behind; a write past it fails as glider fails it, rolled back. The
+instance's `budget` counts a memory flight's bytes (`Glider.stats/1`'s
+`memory_bytes`, measured by the caller after each statement and by each
+shipping pass) beside working copies' bytes on disk.
 
-Both are designed in glider's `docs/TIERS.md` and land there and in glider_ex
-first. Aerotow asks glider_ex what it can do and refuses a mode it cannot
-fly, by name.
+A memory flight lost with log that never shipped has no file to move (R14).
+Before it closes its handle it writes what it holds, a whole base, to a
+directory replica, `<dir>/orphans/<store>/<ref>.<n>.replica/`, with the
+flight's marker beside it. `orphans/1` lists it, and recovery carries it as
+it carries a copy (R15): restored into the next flight, in memory or to disk
+as the card says then, and removed once that flight is up.
+
+**A hot set.** A flight from disk with `hot:` opens with `hot_size:`. Glider
+keeps the list of hot pages beside the file and puts it in each base it
+ships, and a restore lays it beside the copy, so a launch from a base is
+warm. Since the list travels only with a base, a hot flight whose hot set
+changed while it was up ships a new base, from a checkpoint taken then, as
+the last pass of its landing. `info/1` reports the hot set's counters (`hot:
+%{hot_capacity, hot_pages, hot_hits, promotions, demotions, prewarmed}`).
+
+What it costs: a memory flight holds the whole graph, and what it wrote and
+has not shipped dies with the VM (see "What can go wrong"). A hot flight
+whose set moved uploads a whole base each time it lands.
 
 ## Processes
 
@@ -522,10 +557,11 @@ relaunched by the next statement, through R15.
 | what happens | what aerotow does |
 |---|---|
 | the holder is killed with unshipped log | after `ttl + grace` another instance launches from what was shipped; at most `sync_interval` of writes are gone (none with `sync: :commit`) |
-| the holder restarts on the same disk | it finds its working copy and carries it into the next flight (R15): nothing is lost |
+| the VM holding a memory flight is killed | its unshipped writes are gone with it: there is no file to carry. That is the cost of memory; `sync: :commit` and a short `sync_interval` keep the window small |
+| the holder restarts on the same disk | it finds its working copy and carries it into the next flight (R15): nothing is lost from disk; a memory flight left nothing to find |
 | the holder freezes past its lease and wakes | its flight is lost (R10); what it ships lands in a directory nobody reads (R5) |
 | two instances launch at once | one creates the record, the other fails and forwards (R7, R9) |
-| the store is unreachable | renewals fail until `expires_at - margin`, then the flight is lost and its copy is kept in `orphans/` (R14); when the store is back the copy is carried into the next flight if nobody else took off |
+| the store is unreachable | renewals fail until `expires_at - margin`, then the flight is lost and its copy is kept in `orphans/` (R14; a memory flight writes a replica there); when the store is back the copy is carried into the next flight if nobody else took off |
 | a card or record in the store is garbage | it is refused where it is read; a glider with no readable flight record does not launch |
 | the catalog file is lost | `scan/2` rebuilds it from the stores (R2) |
 | a bucket has no conditional writes | `add_store` reports `cas: false` and refuses to write there unless `single_writer: true` promises there is no second instance |
@@ -534,7 +570,8 @@ relaunched by the next statement, through R15.
 ## Telemetry
 
 Spans, `[:aerotow, <event>, :start | :stop | :exception]`:
-`:launch` (ref, store, flight, mode, from; bytes), `:land`, `:sync` (bytes,
+`:launch` (ref, store, flight, mode, from; bytes; `mode`, `"memory"` or
+`"disk"`, is on its stop, being decided as it runs), `:land`, `:sync` (bytes,
 bases, segments, lag), `:forward` (ref, op, via), `:scan` (store; seen,
 added, updated, removed), `:statement` (ref, op, where). Events:
 `[:aerotow, :lease, :renewed | :lost]`, `[:aerotow, :flight, :orphaned]`,
@@ -584,4 +621,4 @@ Slices, each with its own tests. A slice depends on those named after it.
 | facade | `Aerotow`, `Aerotow.Server`, routing; create, adopt, scan, the whole table above, in one instance | flight, store-s3 |
 | peer | `Aerotow.Wire`, `Aerotow.Plug`, `Aerotow.Store.Peer`; forwarding over HTTP and over distribution | facade |
 | recovery | carrying a copy (R15), orphans (R14), retention, telemetry | facade |
-| modes | memory flights and the hot set, once glider has them | flight, engine |
+| modes | memory flights and the hot set (glider #9, #10) | flight, engine |

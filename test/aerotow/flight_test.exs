@@ -1,7 +1,11 @@
 defmodule Aerotow.FlightTest do
   # Not async: the first store in a VM loads code and makes atoms, and
   # Aerotow.CardTest counts the VM's atoms while it runs.
-  use ExUnit.Case, async: false
+  #
+  # Every property here is held by a flight from disk and by a flight in
+  # memory: the module runs once for each, with the instance's mode set.
+  # Where what is on disk differs by mode, the test says what each leaves.
+  use ExUnit.Case, async: false, parameterize: [%{mode: "disk"}, %{mode: "memory"}]
 
   import Aerotow.FlightCase
 
@@ -20,18 +24,55 @@ defmodule Aerotow.FlightTest do
   @margin 5_000
   @grace 5_000
 
-  setup %{tmp_dir: dir} do
+  setup %{tmp_dir: dir, mode: mode} do
     {clock, set} = clock()
-    a = instance(dir, "a", clock: clock)
+    a = instance(dir, "a", clock: clock, mode: mode)
     store = dir_store(Path.join(dir, "store"), [a])
     %{dir: dir, clock: clock, set: set, a: a, store: store}
   end
 
-  # A second instance on the same store: its own dir, catalog and registry.
-  defp second(%{dir: dir, clock: clock, store: store}, opts \\ []) do
-    b = instance(dir, "b", [clock: clock] ++ opts)
-    :ok = Catalog.put_store(b.catalog, Store.public(store))
-    b
+  # Another instance in this test's mode, on the same store and clock: its
+  # own dir, catalog and registry.
+  defp tow(ctx, label, opts) do
+    instance = instance(ctx.dir, label, [clock: ctx.clock, mode: ctx.mode] ++ opts)
+    :ok = Catalog.put_store(instance.catalog, Store.public(ctx.store))
+    instance
+  end
+
+  defp second(ctx), do: tow(ctx, "b", [])
+
+  defp memory?(ctx), do: ctx.mode == "memory"
+
+  # What a flight aloft has on disk: a working copy from disk, nothing in
+  # memory.
+  defp assert_aloft_copy(ctx, instance, store) do
+    if memory?(ctx) do
+      refute Copy.exists?(working(instance, store))
+      assert files_under(Path.join(instance.dir, "flights")) == []
+    else
+      assert Copy.exists?(working(instance, store))
+    end
+  end
+
+  # Where flight n's copy is kept when it was lost with log that never
+  # shipped: the copy itself, or the replica a memory flight writes.
+  defp orphan(ctx, instance, store, n) do
+    if memory?(ctx),
+      do: Copy.orphan_replica_path(instance, store, @ref, n),
+      else: Copy.orphan_path(instance, store, @ref, n)
+  end
+
+  # The `n` of every `:N` node in an orphan of either kind.
+  defp orphan_ns(path) do
+    if Copy.replica?(path) do
+      out = Path.join([Path.dirname(path), "restored-#{System.unique_integer([:positive])}.gldb"])
+      {:ok, _} = Copy.restore(path, [], out)
+      ns = ns_in(out)
+      :ok = Copy.remove(out)
+      ns
+    else
+      ns_in(path)
+    end
   end
 
   # The store wrapped so the test can make it fail or stall.
@@ -283,9 +324,8 @@ defmodule Aerotow.FlightTest do
 
     test "a long statement in one process delays neither a lease renewal nor another caller's info/1",
          ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       listen([[:aerotow, :lease, :renewed]])
       {:ok, pid} = create(a, store, @ref)
       test = self()
@@ -371,9 +411,8 @@ defmodule Aerotow.FlightTest do
 
   describe "8: shipping" do
     test "after a write the store has it within sync_interval, without anybody asking", ctx do
-      %{dir: dir, clock: clock, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{dir: dir, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       {:ok, pid} = create(a, store, @ref)
       listen([[:aerotow, :sync, :stop]])
 
@@ -511,9 +550,8 @@ defmodule Aerotow.FlightTest do
   describe "11: a slow store" do
     test "delays no checkout or info/1, and a stuck renewal does not keep the flight up past its deadline",
          ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       {stall, ctl} = stalling(store)
       listen([[:aerotow, :lease, :lost]])
       {:ok, pid} = create(a, stall, @ref)
@@ -550,8 +588,7 @@ defmodule Aerotow.FlightTest do
       {:ok, _} = Flight.run(pid, :write, &Glider.run(&1, "INDEX ON :N(n)"))
       for n <- 1..3, do: {:ok, _} = write(pid, n)
       {:ok, _} = Flight.run(pid, :write, &Glider.run(&1, "CREATE (:M)-[:R]->(:M)"))
-      path = working(a, store)
-      assert Copy.exists?(path)
+      assert_aloft_copy(ctx, a, store)
 
       assert :ok = Flight.land(pid)
       assert :normal = down(pid)
@@ -577,9 +614,8 @@ defmodule Aerotow.FlightTest do
     end
 
     test "a flight lands once idle has passed with nothing checked out", ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "idle", clock: clock, idle: 20_000)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "idle", idle: 20_000)
       {:ok, pid} = create(a, store, @ref)
       {:ok, _} = write(pid, 1)
       %{last_used: used} = Flight.info(pid)
@@ -610,9 +646,8 @@ defmodule Aerotow.FlightTest do
     end
 
     test "a pinned flight does not land for being idle; land/2 lands it anyway", ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "idle", clock: clock, idle: 20_000)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "idle", idle: 20_000)
       {:ok, card} = Card.new(@ref)
       {:ok, pid} = fly(a, store, @ref, {:create, card}, pin: true)
       %{last_used: used, pinned: true} = Flight.info(pid)
@@ -629,9 +664,8 @@ defmodule Aerotow.FlightTest do
 
   describe "14: a last ship that fails" do
     test "keeps the flight aloft and answering, and it lands when the store is back", ctx do
-      %{dir: dir, clock: clock, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       {stall, ctl} = stalling(store)
       listen([[:aerotow, :land, :exception]])
       {:ok, pid} = create(a, stall, @ref)
@@ -643,7 +677,7 @@ defmodule Aerotow.FlightTest do
       spawn(fn -> send(test, {:landed, Flight.land(pid)}) end)
 
       assert_receive {:telemetry, [:aerotow, :land, :exception], _, %{ref: @ref}}, 5_000
-      assert Copy.exists?(path)
+      assert_aloft_copy(ctx, a, store)
       assert {:ok, {:ok, _}} = write(pid, 2)
       assert ns(pid) == [1, 2]
       refute_received {:landed, _}
@@ -661,9 +695,8 @@ defmodule Aerotow.FlightTest do
   describe "15: lost (R10, R14)" do
     test "R10, R14: renewals that fail until the deadline lose the flight, and a copy with unshipped log is kept aside",
          ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       {stall, ctl} = stalling(store)
       listen([[:aerotow, :lease, :lost], [:aerotow, :flight, :orphaned]])
       {:ok, pid} = create(a, stall, @ref)
@@ -685,19 +718,27 @@ defmodule Aerotow.FlightTest do
       assert {:shutdown, :lost} = down(pid)
       assert snapshot(store) == before
 
-      assert orphan == Path.join([a.dir, "orphans", "store", @ref <> ".1.gldb"])
+      assert orphan == orphan(ctx, a, store, 1)
+
+      assert orphan ==
+               Path.join([
+                 a.dir,
+                 "orphans",
+                 "store",
+                 @ref <> if(memory?(ctx), do: ".1.replica", else: ".1.gldb")
+               ])
+
       assert File.regular?(Copy.marker_path(orphan))
       assert {:ok, %{store: "store", ref: @ref, flight: 1}} = Copy.read_marker(orphan)
       refute Copy.exists?(working(a, store))
-      assert ns_in(orphan) == [1, 2]
+      assert orphan_ns(orphan) == [1, 2]
       assert Registry.lookup(a.registry, @ref) == []
     end
 
     test "R10: a renewal that finds a higher flight loses the flight, and a copy with nothing unshipped is deleted",
          ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       listen([[:aerotow, :lease, :lost], [:aerotow, :flight, :orphaned]])
       {:ok, pid} = create(a, store, @ref)
       lease = record(store, 1)
@@ -716,9 +757,8 @@ defmodule Aerotow.FlightTest do
     end
 
     test "R10: a renewal that finds the record no longer this flight's loses the flight", ctx do
-      %{dir: dir, clock: clock, set: set, store: store} = ctx
-      a = instance(dir, "quick", clock: clock, sync_interval: 20)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{set: set, store: store} = ctx
+      a = tow(ctx, "quick", sync_interval: 20)
       {:ok, pid} = create(a, store, @ref)
       lease = record(store, 1)
 
@@ -730,7 +770,7 @@ defmodule Aerotow.FlightTest do
     end
 
     test "R10: a lost flight ships nothing from that instant, however long a stuck pass takes to return",
-         %{a: a, store: store, set: set} do
+         %{a: a, store: store, set: set} = ctx do
       {stall, ctl} = stalling(store)
       {:ok, pid} = create(a, stall, @ref)
       lease = record(store, 1)
@@ -750,68 +790,82 @@ defmodule Aerotow.FlightTest do
       StallStore.release(ctl)
       _ = :sys.get_state(ctl)
       assert snapshot(store) == before
-      assert ns_in(Copy.orphan_path(a, store, @ref, 1)) == [1]
+      assert orphan_ns(orphan(ctx, a, store, 1)) == [1]
     end
   end
 
   describe "16: killed" do
-    test "a flight killed while dirty leaves its copy, its marker and its lease, and nothing half-written",
-         %{a: a, store: store} do
+    test "a flight killed while dirty leaves its lease and nothing half-written: from disk its copy and marker, in memory nothing",
+         %{a: a, store: store} = ctx do
       {:ok, pid} = create(a, store, @ref)
       {:ok, _} = write(pid, 1)
       lease = record(store, 1)
       before = snapshot(store)
-
-      kill(pid, working(a, store))
-
       path = working(a, store)
-      assert File.regular?(path)
-      assert {:ok, %{flight: 1, ref: @ref, store: "store"}} = Copy.read_marker(path)
+
+      if memory?(ctx) do
+        Process.exit(pid, :kill)
+        assert :killed = down(pid)
+        assert files_under(a.dir) |> Enum.filter(&String.contains?(&1, "/flights/")) == []
+      else
+        kill(pid, path)
+        assert File.regular?(path)
+        assert {:ok, %{flight: 1, ref: @ref, store: "store"}} = Copy.read_marker(path)
+        assert ns_in(path) == [1]
+      end
+
       assert record(store, 1) == lease
       assert snapshot(store) == before
-      assert ns_in(path) == [1]
     end
   end
 
   describe "17: carry (R15)" do
-    test "R15: a copy whose flight is the newest is carried into the next flight, at once, and shipped whole",
+    test "R15: a copy whose flight is the newest is carried into the next flight, at once, and shipped whole; a memory flight killed has none, and its unshipped writes are gone",
          ctx do
       %{a: a, store: store, dir: dir} = ctx
       listen([[:aerotow, :sync, :stop]])
       {:ok, pid} = create(a, store, @ref)
-      {:ok, _} = write(pid, 1)
+      {:ok, _} = write(pid, 1, sync: :commit)
       {:ok, _} = write(pid, 2)
-      kill(pid, working(a, store))
-      path = working(a, store)
 
-      # The clock has not moved: flight 1 is still active, and is this
-      # instance's own, so it is taken over at once.
-      {:ok, pid} = fly(a, store, @ref, {:carry, path})
-      assert %{flight: 2} = Flight.info(pid)
-      assert %Lease{from: %{carried: true}} = record(store, 2)
-      assert_receive {:telemetry, [:aerotow, :sync, :stop], %{bases: bases}, %{flight: 2}}, 5_000
-      assert bases >= 1
-      assert shipped_ns(store, @ref, 2, dir) == [1, 2]
+      if memory?(ctx) do
+        Process.exit(pid, :kill)
+        assert :killed = down(pid)
 
-      :ok = Flight.land(pid)
-      {:ok, pid} = launch(second(ctx), store, @ref)
-      assert ns(pid) == [1, 2]
+        # Flight 1 is this instance's own and has nobody behind it: the
+        # next launch takes it over at once, from what was shipped.
+        {:ok, pid} = launch(a, store, @ref)
+        assert %{flight: 2, mode: "memory"} = Flight.info(pid)
+        assert ns(pid) == [1]
+      else
+        kill(pid, working(a, store))
+        path = working(a, store)
+
+        # The clock has not moved: flight 1 is still active, and is this
+        # instance's own, so it is taken over at once.
+        {:ok, pid} = fly(a, store, @ref, {:carry, path})
+        assert %{flight: 2} = Flight.info(pid)
+        assert %Lease{from: %{carried: true}} = record(store, 2)
+
+        assert_receive {:telemetry, [:aerotow, :sync, :stop], %{bases: bases}, %{flight: 2}},
+                       5_000
+
+        assert bases >= 1
+        assert shipped_ns(store, @ref, 2, dir) == [1, 2]
+
+        :ok = Flight.land(pid)
+        {:ok, pid} = launch(second(ctx), store, @ref)
+        assert ns(pid) == [1, 2]
+      end
     end
 
     test "R15: a copy kept in orphans/ is carried from there", ctx do
-      %{a: a, store: store, set: set, dir: dir} = ctx
-      {stall, ctl} = stalling(store)
-      {:ok, pid} = create(a, stall, @ref)
-      {:ok, _} = write(pid, 1)
-      StallStore.set(ctl, [:put, :replica], :fail)
-      set.(deadline(record(store, 1)))
-      assert %{state: :lost} = Flight.info(pid)
-      {:shutdown, :lost} = down(pid)
-      StallStore.release(ctl)
+      %{a: a, store: store, dir: dir} = ctx
+      orphan = lost_with_unshipped(ctx, [1])
 
-      orphan = Copy.orphan_path(a, store, @ref, 1)
       {:ok, pid} = fly(a, store, @ref, {:carry, orphan})
       refute Copy.exists?(orphan)
+      assert %Lease{from: %{carried: true}} = record(store, 2)
       {:ok, _} = Flight.sync(pid)
       assert shipped_ns(store, @ref, 2, dir) == [1]
     end
@@ -819,12 +873,18 @@ defmodule Aerotow.FlightTest do
     test "R15: a copy whose flight is not the newest is {:launch, :superseded}, and is left as it was",
          ctx do
       %{a: a, store: store, set: set} = ctx
-      {:ok, pid} = create(a, store, @ref)
-      {:ok, _} = write(pid, 1)
-      lease = record(store, 1)
-      kill(pid, working(a, store))
 
-      path = working(a, store)
+      path =
+        if memory?(ctx) do
+          lost_with_unshipped(ctx, [1])
+        else
+          {:ok, pid} = create(a, store, @ref)
+          {:ok, _} = write(pid, 1)
+          kill(pid, working(a, store))
+          working(a, store)
+        end
+
+      lease = record(store, 1)
       copy = Map.new(files_under(Path.dirname(path)), &{&1, File.read!(&1)})
 
       # Another instance waits out the lease and moves on.
@@ -838,15 +898,43 @@ defmodule Aerotow.FlightTest do
     end
 
     test "a launch that finds a working copy where its own would go refuses, and leaves it",
-         %{a: a, store: store} do
+         %{a: a, store: store} = ctx do
       {:ok, pid} = create(a, store, @ref)
       {:ok, _} = write(pid, 1)
-      kill(pid, working(a, store))
       path = working(a, store)
+
+      if memory?(ctx) do
+        # A memory flight makes no copy; one left by an earlier flight from
+        # disk stops it all the same, since it may hold log nobody shipped.
+        {:ok, _} = Flight.sync(pid)
+        Process.exit(pid, :kill)
+        assert :killed = down(pid)
+        {url, opts} = Store.replica(store, Layout.flight_data(@ref, 1))
+        {:ok, _} = Copy.restore(url, opts, path)
+        :ok = Copy.write_marker(path, store, @ref, 1)
+      else
+        kill(pid, path)
+      end
 
       assert {:error, {:launch, {:copy_exists, ^path}}} = launch(a, store, @ref)
       assert ns_in(path) == [1]
     end
+  end
+
+  # A flight that wrote `ns` and was lost with them unshipped, its store
+  # failing: answers where its orphan is (a copy, or a memory replica).
+  defp lost_with_unshipped(%{a: a, store: store, set: set} = ctx, ns) do
+    {stall, ctl} = stalling(store)
+    {:ok, pid} = create(a, stall, @ref)
+    for n <- ns, do: {:ok, _} = write(pid, n)
+    StallStore.set(ctl, [:put, :replica], :fail)
+    set.(deadline(record(store, 1)))
+    assert %{state: :lost} = Flight.info(pid)
+    {:shutdown, :lost} = down(pid)
+    StallStore.release(ctl)
+    path = orphan(ctx, a, store, 1)
+    assert Copy.exists?(path)
+    path
   end
 
   # ------------------------------------------------------------------ everything else
@@ -889,7 +977,7 @@ defmodule Aerotow.FlightTest do
 
   describe "19: telemetry" do
     test "launch, sync and land are spans with the metadata the design lists",
-         %{a: a, store: store} do
+         %{a: a, store: store} = ctx do
       events =
         for name <- [:launch, :sync, :land],
             phase <- [:start, :stop, :exception],
@@ -901,19 +989,22 @@ defmodule Aerotow.FlightTest do
       {:ok, _} = Flight.sync(pid)
       :ok = Flight.land(pid)
 
+      mode = ctx.mode
+
       assert_received {:telemetry, [:aerotow, :launch, :start], %{system_time: _},
-                       %{ref: @ref, store: "store", mode: "disk"}}
+                       %{ref: @ref, store: "store"}}
 
       assert_received {:telemetry, [:aerotow, :launch, :stop], %{duration: _, bytes: bytes},
-                       %{ref: @ref, store: "store", flight: 1, mode: "disk", from: nil}}
+                       %{ref: @ref, store: "store", flight: 1, mode: ^mode, from: nil}}
 
-      assert bytes > 0
+      # An empty graph takes no pages in memory; on disk its file has some.
+      if memory?(ctx), do: assert(is_integer(bytes)), else: assert(bytes > 0)
 
       assert_received {:telemetry, [:aerotow, :sync, :start], _, %{ref: @ref, flight: 1}}
 
       assert_received {:telemetry, [:aerotow, :sync, :stop],
                        %{duration: _, bytes: _, bases: _, segments: _, lag: _},
-                       %{ref: @ref, store: "store", flight: 1, mode: "disk"}}
+                       %{ref: @ref, store: "store", flight: 1, mode: ^mode}}
 
       assert_received {:telemetry, [:aerotow, :land, :start], _, %{ref: @ref, flight: 1}}
 
@@ -972,9 +1063,8 @@ defmodule Aerotow.FlightTest do
 
   describe "21: a sync that never returns" do
     test "is abandoned after sync_timeout and reported, and the flight carries on", ctx do
-      %{dir: dir, clock: clock, store: store} = ctx
-      a = instance(dir, "slow", clock: clock, sync_timeout: 200)
-      :ok = Catalog.put_store(a.catalog, Store.public(store))
+      %{store: store} = ctx
+      a = tow(ctx, "slow", sync_timeout: 200)
       {stall, ctl} = stalling(store)
       listen([[:aerotow, :sync, :exception]])
       {:ok, pid} = create(a, stall, @ref)

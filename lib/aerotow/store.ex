@@ -56,6 +56,8 @@ defmodule Aerotow.Store do
             config: %{},
             cas: nil,
             single_writer: false,
+            mode: nil,
+            hot: nil,
             id: nil
 
   @type kind :: :file | :dir | :s3 | :peer
@@ -83,6 +85,8 @@ defmodule Aerotow.Store do
           config: map(),
           cas: boolean() | nil,
           single_writer: boolean(),
+          mode: String.t() | nil,
+          hot: non_neg_integer() | nil,
           id: String.t() | nil
         }
 
@@ -126,7 +130,9 @@ defmodule Aerotow.Store do
 
   Options: `kind:`, `single_writer:` (default `false`: the promise that no
   second instance writes to this store), `clock:` (an `Aerotow.Clock`, for
-  the marker's `created_at`), and whatever the kind's module takes
+  the marker's `created_at`), `mode:` and `hot:` (where the gliders kept
+  here hold their pages when aloft, over what their cards say; see
+  `Aerotow.Flight.Copy.decide/3`), and whatever the kind's module takes
   (`endpoint:`, `token:`, …).
   """
   @spec new(String.t(), String.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
@@ -137,6 +143,8 @@ defmodule Aerotow.Store do
          :ok <- check_name(name),
          {:ok, kind, location} <- kind(url, Keyword.get(opts, :kind)),
          {:ok, single_writer} <- single_writer(opts),
+         {:ok, mode} <- Aerotow.Options.mode(Keyword.get(opts, :mode)),
+         {:ok, hot} <- Aerotow.Options.hot(Keyword.get(opts, :hot)),
          {:ok, clock} <- clock(opts),
          {:ok, mod} <- module(kind),
          {:ok, config} <- init(mod, name, location, opts) do
@@ -146,7 +154,9 @@ defmodule Aerotow.Store do
         url: shown(kind, location),
         mod: mod,
         config: config,
-        single_writer: single_writer
+        single_writer: single_writer,
+        mode: mode,
+        hot: hot
       }
 
       if objects?(store), do: open(store, clock), else: {:ok, store}

@@ -4,12 +4,15 @@ defmodule Aerotow.Orphans do
   never shipped, set aside rather than thrown away (R14).
 
       <dir>/orphans/<store>/<ref>.<flight>.gldb          the copy, with glider's files beside it
+      <dir>/orphans/<store>/<ref>.<flight>.replica/      or a memory flight's replica, in its place
       <dir>/orphans/<store>/<ref>.<flight>.flight.json   its marker (`Aerotow.Flight.Copy`)
       <dir>/orphans/<store>/<ref>.<flight>.note.json     why it is here, when it was set aside
       <dir>/orphans/left-<unix ms>/…                     files found under flights/ that were no copy
 
   A copy gets here three ways: its flight was lost with log that never
-  shipped (`Aerotow.Flight` moves it, and writes no note); the instance
+  shipped (`Aerotow.Flight` moves it, and writes no note; a flight in
+  memory has no copy to move, and writes what it holds as a replica in a
+  directory instead); the instance
   started and found it under `flights/` and could not carry it; or a launch
   found it where its own copy goes and could not carry it
   (`Aerotow.Copies.set_aside/3`, which writes the note).
@@ -57,7 +60,8 @@ defmodule Aerotow.Orphans do
       "/w/orphans/assets/a/b.3.note.json"
   """
   @spec note_path(Path.t()) :: Path.t()
-  def note_path(path), do: String.replace_suffix(path, ".gldb", "") <> ".note.json"
+  def note_path(path),
+    do: String.replace_suffix(Copy.marker_path(path), ".flight.json", "") <> ".note.json"
 
   @doc """
   Writes why the copy at `path` is an orphan, with the time on the
@@ -128,9 +132,9 @@ defmodule Aerotow.Orphans do
     |> Enum.flat_map(fn name ->
       cond do
         String.ends_with?(name, ".flight.json") ->
-          [String.replace_suffix(name, ".flight.json", ".gldb")]
+          [name |> Path.expand(Path.dirname(base)) |> Copy.of_marker() |> Path.basename()]
 
-        String.ends_with?(name, ".gldb") ->
+        String.ends_with?(name, [".gldb", ".replica"]) ->
           [name]
 
         true ->
@@ -170,8 +174,9 @@ defmodule Aerotow.Orphans do
 
   # ------------------------------------------------------------------ reading
 
-  # The copies under orphans/: databases and markers, each as the path of
-  # its database. What is inside glider's own directories is not a copy.
+  # The copies under orphans/: databases, replicas and markers, each as the
+  # path of its database or replica. What is inside glider's own directories
+  # is not a copy.
   defp copies(root) do
     if File.dir?(root) do
       root
@@ -180,13 +185,13 @@ defmodule Aerotow.Orphans do
       |> Enum.reject(&String.starts_with?(Path.relative_to(&1, root), "left-"))
       |> Enum.flat_map(fn path ->
         cond do
-          String.contains?(path, [".gldb-", ".gldb/", ".gldb.restoring"]) ->
+          String.contains?(path, [".gldb-", ".gldb/", ".gldb.restoring", ".replica/"]) ->
             []
 
           String.ends_with?(path, ".flight.json") ->
-            [String.replace_suffix(path, ".flight.json", ".gldb")]
+            [Copy.of_marker(path)]
 
-          String.ends_with?(path, ".gldb") ->
+          String.ends_with?(path, [".gldb", ".replica"]) ->
             [path]
 
           true ->

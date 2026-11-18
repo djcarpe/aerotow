@@ -26,14 +26,16 @@ defmodule Aerotow.Flight do
   glider with no flight process.
 
     * **launching** - `Aerotow.Flight.Launch` takes the flight (R9),
-      restores the newest shipped state into the working copy, or makes a
-      new glider and ships its first base, or carries a copy left on disk
-      (R15), and opens it; the flight then records where it started. Calls
-      wait until the flight is up. A launch that fails leaves nothing
-      behind: no working copy, no registry entry, and the flight record it
-      took landed with nothing shipped, so the next taker need not wait out
-      a lease. The process is then **failed**, answers the callers that
-      waited, and exits `:normal`.
+      restores the newest shipped state into the working copy or into
+      memory (where the glider's pages live is decided then, from its card,
+      its store and the instance: `Aerotow.Flight.Copy.decide/4`), or makes
+      a new glider and ships its first base, or carries a copy or replica
+      left behind (R15), and opens it; the flight then records where it
+      started. Calls wait until the flight is up. A launch that fails
+      leaves nothing behind: no working copy, no registry entry, and the
+      flight record it took landed with nothing shipped, so the next taker
+      need not wait out a lease. The process is then **failed**, answers
+      the callers that waited, and exits `:normal`.
     * **aloft** - statements run, each in its caller's process: the handle
       is lent with `checkout/3` and given back with `checkin/3`, or around
       a function with `run/4`. Writes make the flight dirty; a dirty flight
@@ -54,7 +56,17 @@ defmodule Aerotow.Flight do
       ships nothing from that instant: a pass under way is abandoned. Once
       no caller holds the handle it is closed; a working copy with log that
       never shipped is moved whole to `<dir>/orphans/`, and one with
-      nothing unshipped is deleted. The process exits `{:shutdown, :lost}`.
+      nothing unshipped is deleted. A flight in memory with log that never
+      shipped first writes what it holds to a replica in `<dir>/orphans/`
+      (`Aerotow.Flight.Copy.keep_memory/5`). The process exits
+      `{:shutdown, :lost}`.
+
+  A flight in memory and a flight from disk go through the same states and
+  keep the same rules (R5, R10, R11); what differs is in
+  `Aerotow.Flight.Copy`. A flight from disk with a hot set whose set
+  changed while it was up ships, as the last pass of its landing, a new
+  base from a checkpoint taken then: the list of hot pages travels in a
+  base, and so the next launch, here or anywhere, starts warm.
 
   A glider homed in a `file` store has no flight record and no shipping: it
   is opened where it lies, and glider's own lock is the guard. It is never
@@ -83,7 +95,8 @@ defmodule Aerotow.Flight do
   ## Telemetry
 
   Spans `[:aerotow, :launch | :sync | :land, :start | :stop | :exception]`,
-  with `ref`, `store`, `flight` and `mode` in their metadata; a launch's stop
+  with `ref`, `store`, `flight` and `mode` in their metadata (`mode` is
+  `nil` on a launch's start: it is decided as the launch runs); a launch's stop
   adds `from` and the measurement `bytes`; a pass's stop has the
   measurements `bytes`, `bases`, `segments` and `lag`. Events
   `[:aerotow, :lease, :renewed]`, `[:aerotow, :lease, :lost]` (with
@@ -281,10 +294,17 @@ defmodule Aerotow.Flight do
   """
   @spec checkout(pid(), :read | :write, timeout()) ::
           {:ok, Glider.db(), reference()} | {:error, reason()}
-  def checkout(pid, mode, timeout \\ @call_timeout) when mode in [:read, :write] do
-    token = make_ref()
+  def checkout(pid, mode, timeout \\ @call_timeout) when mode in [:read, :write],
+    do: lend(pid, {:checkout, mode, make_ref()}, timeout)
 
-    case call(pid, {:checkout, mode, token}, timeout) do
+  defp lend(pid, {:checkout, _mode, token} = message, timeout),
+    do: lend(pid, token, message, timeout)
+
+  defp lend(pid, {:checkout, _mode, token, _measure} = message, timeout),
+    do: lend(pid, token, message, timeout)
+
+  defp lend(pid, token, message, timeout) do
+    case call(pid, message, timeout) do
       {:error, :timeout} ->
         # It may yet be lent, after this caller stopped waiting: give it back.
         GenServer.cast(pid, {:cancel, token})
@@ -302,7 +322,8 @@ defmodule Aerotow.Flight do
     :ok
   end
 
-  defp checkin_seq(pid, token, wrote?), do: call(pid, {:checkin, token, wrote?}, :infinity)
+  defp checkin_seq(pid, token, wrote?, measured \\ nil),
+    do: call(pid, {:checkin, token, wrote?, measured}, :infinity)
 
   @doc """
   Runs `fun.(db)` with the handle lent to the calling process, and gives it
@@ -313,6 +334,11 @@ defmodule Aerotow.Flight do
   default 30 s) and `sync: :commit`, which for a write ships before
   answering, and answers `{:error, :lost}` if the lease was past its
   margin when the ship finished (R11).
+
+  A flight in memory, or with a hot set, has the caller measure the glider
+  (`Aerotow.Flight.Copy.measure/1`) after `fun` and before giving the
+  handle back: that is how `info/1`'s `bytes` and `hot` stay current
+  without the flight process ever touching the handle.
   """
   @spec run(pid(), :read | :write, (Glider.db() -> result), keyword()) ::
           {:ok, result} | {:error, reason()}
@@ -321,7 +347,7 @@ defmodule Aerotow.Flight do
     timeout = Keyword.get(opts, :timeout, @call_timeout)
     wrote? = mode == :write
 
-    with {:ok, db, token} <- checkout(pid, mode, timeout) do
+    with {:ok, db, token, measure?} <- lend(pid, {:checkout, mode, make_ref(), :measure}, timeout) do
       result =
         try do
           fun.(db)
@@ -331,7 +357,9 @@ defmodule Aerotow.Flight do
             :erlang.raise(kind, reason, __STACKTRACE__)
         end
 
-      case {checkin_seq(pid, token, wrote?), Keyword.get(opts, :sync)} do
+      measured = if measure?, do: Copy.measure(db)
+
+      case {checkin_seq(pid, token, wrote?, measured), Keyword.get(opts, :sync)} do
         {{:ok, seq}, :commit} when wrote? ->
           with :ok <- call(pid, {:commit, seq}, timeout), do: {:ok, result}
 
@@ -371,8 +399,13 @@ defmodule Aerotow.Flight do
 
   @doc """
   What the flight is doing: `ref`, `store` (its name), `flight` (its
-  number, `nil` in a file store), `state`, `mode`, `bytes` (of the working
-  copy on disk), `dirty` (it holds writes that have not shipped),
+  number, `nil` in a file store), `state`, `mode` (`"memory"` or `"disk"`;
+  `nil` until it is up), `bytes` (of the working copy on disk; for a
+  flight in memory, what its graph took when it was last measured, which
+  is after every statement through `run/4` and every shipping pass),
+  `hot` (the hot set's counters as last measured, `nil` without one:
+  `hot_capacity`, `hot_pages`, `hot_hits`, `promotions`, `demotions`,
+  `prewarmed`), `dirty` (it holds writes that have not shipped),
   `checked_out` (how many checkouts are out), `pinned`, `last_used` and
   `started_at` (on the instance's clock).
   """
@@ -434,6 +467,10 @@ defmodule Aerotow.Flight do
           state: :launching,
           db: nil,
           path: nil,
+          mode: nil,
+          measured: nil,
+          launch_hot: nil,
+          rebased: false,
           lease: nil,
           from: nil,
           card: nil,
@@ -513,6 +550,7 @@ defmodule Aerotow.Flight do
     deferred =
       Enum.reject(state.deferred, fn
         {{:checkout, _mode, ^token}, _from} -> true
+        {{:checkout, _mode, ^token, _measure}, _from} -> true
         _ -> false
       end)
 
@@ -611,8 +649,9 @@ defmodule Aerotow.Flight do
   defp dispatch(%{state: :launching} = state, message, from),
     do: {:noreply, %{state | deferred: [{message, from} | state.deferred]}}
 
-  defp dispatch(state, {:checkin, token, wrote?}, _from) do
+  defp dispatch(state, {:checkin, token, wrote?, measured}, _from) do
     state = give_back(state, token, wrote?)
+    state = if measured, do: %{state | measured: measured}, else: state
     {:reply, {:ok, state.wseq}, state}
   end
 
@@ -624,6 +663,13 @@ defmodule Aerotow.Flight do
       :landing -> landing_call(state, message, from)
       :lost -> {:reply, {:error, :lost}, state}
       :failed -> {:reply, {:error, state.launch_failure}, state}
+    end
+  end
+
+  defp aloft(state, {:checkout, mode, token, :measure}, from) do
+    case aloft(state, {:checkout, mode, token}, from) do
+      {:reply, {:ok, db, ^token}, state} -> {:reply, {:ok, db, token, measures?(state)}, state}
+      other -> other
     end
   end
 
@@ -721,8 +767,9 @@ defmodule Aerotow.Flight do
       store: state.store.name,
       flight: state.lease && state.lease.n,
       state: state.state,
-      mode: Copy.mode(),
-      bytes: if(state.path, do: Copy.bytes(state.path), else: 0),
+      mode: mode_name(state),
+      bytes: bytes_of(state),
+      hot: state.measured && state.measured.hot,
       dirty: dirty?(state),
       checked_out: map_size(state.checkouts),
       pinned: state.pinned,
@@ -730,6 +777,16 @@ defmodule Aerotow.Flight do
       started_at: state.started_at
     }
   end
+
+  defp mode_name(%{mode: %{mode: mode}}), do: mode
+  defp mode_name(_state), do: nil
+
+  # A memory flight's bytes are what its graph took when it was last
+  # measured; a working copy's are what it takes on disk now.
+  defp bytes_of(%{mode: %{mode: "memory"}, measured: measured}),
+    do: (measured && measured.memory) || 0
+
+  defp bytes_of(%{path: path}), do: Copy.bytes(path)
 
   defp nothing_shipped(state) do
     %{
@@ -752,6 +809,25 @@ defmodule Aerotow.Flight do
   defp valid?(state), do: Lease.valid?(state.lease, now(state), state.instance.timing)
 
   defp dirty?(state), do: state.wseq > state.shipped_seq
+
+  defp memory?(%{mode: %{mode: "memory"}}), do: true
+  defp memory?(_state), do: false
+
+  defp hot?(%{mode: %{hot: hot}}) when is_integer(hot), do: true
+  defp hot?(_state), do: false
+
+  # Whose callers measure the glider after each statement.
+  defp measures?(state), do: memory?(state) or hot?(state)
+
+  # A flight with a hot set whose set changed since it launched ships, as it
+  # lands, a new base: the hot list travels with a base only.
+  defp rebase?(state) do
+    hot?(state) and not state.rebased and
+      hot_moves(state.measured && state.measured.hot) != hot_moves(state.launch_hot)
+  end
+
+  defp hot_moves(nil), do: {0, 0}
+  defp hot_moves(hot), do: {hot.promotions, hot.demotions}
 
   # R10: the moment the clock is at the deadline, the flight is lost.
   defp look_at_clock(%{objects: true, lease: %Lease{} = lease, state: s} = state)
@@ -920,6 +996,9 @@ defmodule Aerotow.Flight do
       state
       | db: launched.db,
         path: launched.path,
+        mode: launched.mode,
+        measured: launched.measured,
+        launch_hot: launched.measured && launched.measured.hot,
         card: %{launched.card | store: state.store.name},
         from: launched.from,
         shipped: launched.shipped,
@@ -947,7 +1026,7 @@ defmodule Aerotow.Flight do
     span_stop(
       state.launch_span,
       :launch,
-      %{bytes: Copy.bytes(state.path)},
+      %{bytes: bytes_of(state)},
       meta(state) |> Map.put(:from, state.from)
     )
 
@@ -1023,22 +1102,24 @@ defmodule Aerotow.Flight do
 
   defp ask_pass(state, _why), do: state
 
-  defp start_pass(state, final?) do
+  defp start_pass(state, final?, rebase? \\ false) do
     %{instance: instance, store: store, ref: ref, lease: lease, db: db, path: path} = state
     clock = instance.clock
     timing = instance.timing
+    measure? = measures?(state)
 
     fun = fn ->
       if Lease.valid?(lease, Clock.now(clock), timing) do
         result =
           case Store.replica(store, Layout.flight_data(ref, lease.n)) do
-            {url, opts} when is_binary(url) -> Copy.ship(path, db, url, opts)
+            {url, opts} when is_binary(url) -> Copy.ship(path, db, url, [rebase: rebase?] ++ opts)
             {:error, reason} -> {:error, reason}
           end
 
-        {result, Clock.now(clock)}
+        finished_at = Clock.now(clock)
+        {result, finished_at, if(measure?, do: Copy.measure(db))}
       else
-        {{:error, :lost}, Clock.now(clock)}
+        {{:error, :lost}, Clock.now(clock), nil}
       end
     end
 
@@ -1051,6 +1132,7 @@ defmodule Aerotow.Flight do
       pid: task.pid,
       seq: state.wseq,
       final: final?,
+      rebase: rebase?,
       timer: timer,
       span: span
     }
@@ -1063,7 +1145,9 @@ defmodule Aerotow.Flight do
     state = %{state | pass: nil}
 
     case result do
-      {:ok, {{:ok, report}, finished_at}} ->
+      {:ok, {{:ok, report}, finished_at, measured}} ->
+        state = if measured, do: %{state | measured: measured}, else: state
+
         if Lease.valid?(state.lease, finished_at, state.instance.timing) do
           shipped(state, pass, report)
         else
@@ -1072,11 +1156,11 @@ defmodule Aerotow.Flight do
           go_lost(state, :deadline)
         end
 
-      {:ok, {{:error, :lost}, _finished_at}} ->
+      {:ok, {{:error, :lost}, _finished_at, _measured}} ->
         span_exception(pass.span, :sync, :lost, meta(state))
         go_lost(state, :deadline)
 
-      {:ok, {{:error, reason}, _finished_at}} ->
+      {:ok, {{:error, reason}, _finished_at, _measured}} ->
         pass_failed(state, pass, reason)
 
       other ->
@@ -1109,6 +1193,7 @@ defmodule Aerotow.Flight do
       | shipped_seq: max(state.shipped_seq, pass.seq),
         shipped: shipped,
         bases: bases,
+        rebased: state.rebased or pass.rebase,
         sync_waiters: sync_waiters,
         commit_waiters: commit_waiters
     }
@@ -1260,6 +1345,11 @@ defmodule Aerotow.Flight do
       state.objects and dirty?(state) ->
         if valid?(state),
           do: start_pass(state, true),
+          else: go_lost(state, :deadline)
+
+      state.objects and rebase?(state) ->
+        if valid?(state),
+          do: start_pass(state, true, true),
           else: go_lost(state, :deadline)
 
       true ->
@@ -1442,8 +1532,18 @@ defmodule Aerotow.Flight do
 
   defp finish_lost(state), do: state
 
+  defp lost_now(%{db: db} = state) when db != nil do
+    if memory?(state) do
+      if state.objects and dirty?(state), do: keep_memory(state)
+      Glider.close(db)
+      gone(state)
+    else
+      Glider.close(db)
+      lost_now(%{state | db: nil})
+    end
+  end
+
   defp lost_now(state) do
-    if state.db, do: Glider.close(state.db)
     path = state.path || (state.objects && Copy.path(state.instance, state.store, state.ref))
 
     cond do
@@ -1460,9 +1560,31 @@ defmodule Aerotow.Flight do
         _ = Copy.remove(path)
     end
 
+    gone(state)
+  end
+
+  defp gone(state) do
     _ = Registry.unregister(state.instance.registry, state.ref)
     _ = Catalog.set_aloft(state.instance.catalog, state.ref, false)
     %{state | db: nil, exit: {:shutdown, :lost}}
+  end
+
+  # R14 in memory: there is no file to move, so what the graph holds is
+  # written to a directory replica in orphans/, before the handle is closed.
+  defp keep_memory(state) do
+    n = state.lease.n
+    to = Copy.orphan_replica_path(state.instance, state.store, state.ref, n)
+
+    case Copy.keep_memory(state.db, to, state.store, state.ref, n) do
+      :ok ->
+        emit([:flight, :orphaned], %{}, meta(state) |> Map.put(:path, to))
+
+      {:error, reason} ->
+        Logger.error(
+          "aerotow: flight #{n} of #{state.ref} was lost in memory with log that never " <>
+            "shipped, and what it held could not be written aside (#{reason}); it is gone"
+        )
+    end
   end
 
   defp orphan(state, path) do
@@ -1523,7 +1645,7 @@ defmodule Aerotow.Flight do
       ref: state.ref,
       store: state.store.name,
       flight: state.lease && state.lease.n,
-      mode: Copy.mode()
+      mode: mode_name(state)
     }
   end
 

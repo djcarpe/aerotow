@@ -87,7 +87,7 @@ defmodule Aerotow.Retention do
 
     with %{state: :aloft, flight: n} when is_integer(n) <- info,
          {:ok, result} <-
-           Flight.run(pid, :read, fn _db -> pass(instance, store, ref, n) end,
+           Flight.run(pid, :read, fn db -> pass(instance, store, ref, n, source(info, db)) end,
              timeout: instance.sync_timeout
            ) do
       {:ok, result}
@@ -96,7 +96,11 @@ defmodule Aerotow.Retention do
     end
   end
 
-  defp pass(instance, store, ref, n) do
+  # What glider trims for: a working copy's path, or a memory flight's handle.
+  defp source(%{mode: "memory"}, db), do: db
+  defp source(_info, _db), do: nil
+
+  defp pass(instance, store, ref, n, source) do
     meta = %{ref: ref, store: store.name, flight: n}
 
     retired =
@@ -113,7 +117,11 @@ defmodule Aerotow.Retention do
       with {url, opts} when is_binary(url) <- Store.replica(store, Layout.flight_data(ref, n)),
            opts = Keyword.put(opts, :retention, max(div(instance.retention, 1000), 1)),
            {:ok, count} <-
-             Glider.Replication.enforce_retention(Copy.path(instance, store, ref), url, opts) do
+             Glider.Replication.enforce_retention(
+               source || Copy.path(instance, store, ref),
+               url,
+               opts
+             ) do
         emit(:trimmed, %{objects: count}, meta)
         count
       else
