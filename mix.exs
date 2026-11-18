@@ -36,10 +36,10 @@ defmodule Aerotow.MixProject do
       # deps/glider_ex/native/glider_nif is deps/glider). Move both refs together.
       {:glider,
        github: "djcarpe/glider",
-       ref: "2af9bf110844eb6b14b462ff376961d4c89cf53f",
+       ref: "7aed28154eae65f2e0f00c8a1c491a18ef7a8378",
        app: false,
        compile: false},
-      {:glider_ex, github: "djcarpe/glider_ex", ref: "cb99528c094cc0360f91daa4d3837385f4981636"},
+      {:glider_ex, github: "djcarpe/glider_ex", ref: "5c5db82568bcbd9b0e2f0e226c6650e8422b9d4d"},
       # Cards, flight records and peers travel over HTTP; Req signs S3 requests itself.
       {:req, "~> 0.5"},
       {:telemetry, "~> 1.1"},
