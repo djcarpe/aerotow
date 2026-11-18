@@ -1,5 +1,7 @@
 defmodule Aerotow.CardTest do
-  use ExUnit.Case, async: true
+  # Not async: one test counts the VM's atoms, and modules running beside it
+  # (code loading, NIFs answering for the first time) make atoms of their own.
+  use ExUnit.Case, async: false
 
   alias Aerotow.Card
 
