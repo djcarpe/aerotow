@@ -35,4 +35,6 @@ jobs:
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
+      # Forwarding over Erlang distribution starts a second node.
+      - run: epmd -daemon
       - run: mix test
