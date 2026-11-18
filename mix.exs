@@ -36,7 +36,7 @@ defmodule Aerotow.MixProject do
       # deps/glider_ex/native/glider_nif is deps/glider). Move both refs together.
       {:glider,
        github: "djcarpe/glider",
-       ref: "73ed63f070bc69f78b0de561ad632ab86610ebac",
+       ref: "6edd77c1cf55cfb70cab95d4d521b40c78e45a39",
        app: false,
        compile: false},
       {:glider_ex, github: "djcarpe/glider_ex", ref: "cb99528c094cc0360f91daa4d3837385f4981636"},
